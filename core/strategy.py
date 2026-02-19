@@ -192,6 +192,7 @@ class StrategyEngine:
         self._load_state()
         self._last_candle_t = 0
         self._skip_entry_after_warmup = False  # True after warmup, cleared on first new candle
+        self._warmup_done = False  # Blocks all WS callbacks until warmup + sync complete
         self._lock = False  # Simple reentrance guard for async operations
         self._emergency_first_seen = 0.0  # Emergency backup timer
         self._last_sl_exchange_update = 0.0  # Throttle: last time we updated exchange SL
@@ -301,6 +302,24 @@ class StrategyEngine:
 
         self._save_state()
 
+        # Sync loaded state with actual exchange (position may have closed while bot was down)
+        actual_pos = self.trader.get_position(self.symbol)
+        if actual_pos is None and s.in_position:
+            logger.warning(
+                f"[{self.symbol}] State says in_position but exchange has no position — clearing state"
+            )
+            s.in_position = False
+            s.position_side = ""
+            s.entry_price = 0.0
+            s.entry_size = 0.0
+            s.current_sl = 0.0
+            s.take_profit = 0.0
+            self._last_exchange_sl = 0.0
+            self._save_state()
+
+        # NOW safe to allow WS callbacks (on_price_update, etc.)
+        self._warmup_done = True
+
         logger.info(
             f"[{self.symbol}] Warmup complete: {len(candles)} bars | "
             f"OBs detected: {ob_count} | FVGs detected: {fvg_count} | "
@@ -332,6 +351,12 @@ class StrategyEngine:
         self._last_candle_t = closed_t
         self.state.bar_counter += 1
 
+        # Consume warmup-skip flag on the FIRST new candle (regardless of position state)
+        # This prevents the flag from surviving across multiple candles while in position
+        is_first_after_warmup = self._skip_entry_after_warmup
+        if is_first_after_warmup:
+            self._skip_entry_after_warmup = False
+
         # Use all candles up to and including last closed (exclude current unclosed)
         closed_candles = candles[:-1]
 
@@ -346,9 +371,8 @@ class StrategyEngine:
             await self._manage_position_on_candle(closed_candles)
             return
 
-        # 4. If flat → check entry signals (skip first candle after warmup)
-        if self._skip_entry_after_warmup:
-            self._skip_entry_after_warmup = False
+        # 4. If flat → check entry signals (skip only the very first candle after warmup)
+        if is_first_after_warmup:
             logger.info(f"[{self.symbol}] First candle after warmup — skipping entry check, levels updated.")
             return
 
@@ -726,7 +750,7 @@ class StrategyEngine:
         and create a reverse position.
         """
         s = self.state
-        if not s.in_position or self._lock:
+        if not self._warmup_done or not s.in_position or self._lock:
             return None
 
         # ── Emergency backup: only if price BLEW PAST SL significantly ──
@@ -844,6 +868,9 @@ class StrategyEngine:
         Called from WebSocket when an order update comes in.
         Detects when our SL/TP triggered → handle position close.
         """
+        if not self._warmup_done:
+            return
+
         coin = order_data.get("coin", "")
         if coin != self.symbol:
             return
