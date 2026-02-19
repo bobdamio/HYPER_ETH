@@ -201,8 +201,13 @@ async def main():
     tick_count = 0
     last_heartbeat = time.time()
     last_fallback_check = time.time()
+    last_ws_check = time.time()
     HEARTBEAT_INTERVAL = 120       # seconds between heartbeat logs
     FALLBACK_CHECK_INTERVAL = 60   # REST candle fallback check every 60s
+    WS_CHECK_INTERVAL = 15         # WS health check every 15s
+    WS_STALE_THRESHOLD = 45        # consider WS dead if no price for 45s
+    ws_backoff = 2                 # exponential backoff: starts at 2s
+    WS_BACKOFF_MAX = 30            # max backoff cap
 
     while RUNNING:
         try:
@@ -236,6 +241,55 @@ async def main():
 
             tick_count += 1
 
+            # ── WS health check — runs frequently (every 15s) ──
+            if now - last_ws_check >= WS_CHECK_INTERVAL:
+                last_ws_check = now
+                ws_dead = False
+                if not ws.connected:
+                    ws_dead = True
+                elif ws._last_price_time > 0 and (now - ws._last_price_time) > WS_STALE_THRESHOLD:
+                    ws_dead = True
+
+                if ws_dead:
+                    age = now - ws._last_price_time if ws._last_price_time > 0 else -1
+                    logger.warning(
+                        f"⚠️ WebSocket dead (connected={ws.connected}, "
+                        f"last_price={age:.0f}s ago) — reconnecting (backoff={ws_backoff}s)..."
+                    )
+                    try:
+                        ws.stop()
+                        await asyncio.sleep(ws_backoff)
+                        ws.start()
+                        # Re-seed candle buffers after reconnect
+                        for sym in symbols:
+                            try:
+                                candles = trader.get_candles(sym)
+                                if candles and len(candles) > 30:
+                                    ws.seed_candles(sym, candles, quiet=True)
+                            except Exception:
+                                pass
+                        logger.info("🔌 WebSocket reconnected + candle buffers re-seeded")
+
+                        # Post-reconnect SL sanity: verify exchange SL orders for open positions
+                        for sym in symbols:
+                            eng = engines[sym]
+                            s = eng.state
+                            if s.in_position and s.current_sl > 0:
+                                try:
+                                    # Force re-sync by resetting dedup tracker
+                                    eng._last_exchange_sl = 0.0
+                                    await eng._update_exchange_sl()
+                                    logger.info(
+                                        f"🛡️ [{sym}] Post-reconnect SL verified: {s.current_sl:.2f}"
+                                    )
+                                except Exception as e:
+                                    logger.error(f"[{sym}] Post-reconnect SL sync failed: {e}")
+
+                        ws_backoff = 2  # reset backoff on success
+                    except Exception as e:
+                        logger.error(f"WS reconnect failed: {e}")
+                        ws_backoff = min(ws_backoff * 2, WS_BACKOFF_MAX)  # exponential backoff
+
             # Heartbeat every 2 minutes
             if now - last_heartbeat >= HEARTBEAT_INTERVAL:
                 last_heartbeat = now
@@ -267,25 +321,6 @@ async def main():
                     f"💓 #{tick_count} | ${equity:.2f} | {ws_status}{ws_age} | "
                     + " | ".join(statuses)
                 )
-
-                # WS health check — reconnect if stale
-                if ws._last_price_time > 0 and (now - ws._last_price_time) > 60:
-                    logger.warning("⚠️ WebSocket stale (>60s) — reconnecting...")
-                    try:
-                        ws.stop()
-                        await asyncio.sleep(2)
-                        ws.start()
-                        # Re-seed candle buffers after reconnect
-                        for sym in symbols:
-                            try:
-                                candles = trader.get_candles(sym)
-                                if candles and len(candles) > 30:
-                                    ws.seed_candles(sym, candles, quiet=True)
-                            except Exception:
-                                pass
-                        logger.info("🔌 WebSocket reconnected + candle buffers re-seeded")
-                    except Exception as e:
-                        logger.error(f"WS reconnect failed: {e}")
 
         except KeyboardInterrupt:
             RUNNING = False
