@@ -185,7 +185,7 @@ async def main():
         try:
             candles = trader.get_candles(sym)
             if candles and len(candles) > 30:
-                engines[sym].warmup(candles)
+                await engines[sym].warmup(candles)
                 # Seed WS candle buffer with REST data
                 ws.seed_candles(sym, candles)
                 logger.info(f"[{sym}] Candle buffer seeded: {len(candles)} candles (last t={candles[-1]['t']})")

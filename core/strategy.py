@@ -220,7 +220,7 @@ class StrategyEngine:
             logger.error(f"Failed to save state: {e}")
 
     # ── main tick ────────────────────────────────────────────
-    def warmup(self, candles: List[dict]):
+    async def warmup(self, candles: List[dict]):
         """
         Historical warmup — replay all candles bar-by-bar like Pine Script does.
         Populates OB, FVG levels from history so we don't wait hours for signals.
@@ -314,6 +314,62 @@ class StrategyEngine:
             s.take_profit = 0.0
             self._last_exchange_sl = 0.0
             self._save_state()
+        elif actual_pos is not None and not s.in_position:
+            # Exchange has a position but our state says FLAT.
+            # This is an orphan from crash/race condition — close it immediately.
+            szi = float(actual_pos.get("szi", 0))
+            entry_px = float(actual_pos.get("entryPx", 0))
+            side_str = "long" if szi > 0 else "short"
+            logger.warning(
+                f"[{self.symbol}] Exchange has {side_str} {abs(szi)} @ {entry_px} "
+                f"but state says FLAT — closing orphan position on startup"
+            )
+            try:
+                await self.trader.cancel_all_orders(self.symbol)
+                await asyncio.to_thread(
+                    self.trader.exchange.market_close, self.symbol
+                )
+                logger.info(f"✅ [{self.symbol}] Orphan position closed on startup.")
+            except Exception as e:
+                logger.error(f"❌ [{self.symbol}] Failed to close orphan on startup: {e}")
+        elif actual_pos is not None and s.in_position:
+            # Both agree there's a position — verify side and size match
+            szi = float(actual_pos.get("szi", 0))
+            actual_side = "long" if szi > 0 else "short"
+            actual_size = abs(szi)
+            if actual_side != s.position_side:
+                logger.error(
+                    f"[{self.symbol}] Side mismatch! State={s.position_side} Exchange={actual_side} "
+                    f"— closing and clearing state"
+                )
+                try:
+                    await self.trader.cancel_all_orders(self.symbol)
+                    await asyncio.to_thread(
+                        self.trader.exchange.market_close, self.symbol
+                    )
+                except Exception as e:
+                    logger.error(f"[{self.symbol}] Failed to close mismatched position: {e}")
+                s.in_position = False
+                s.position_side = ""
+                s.entry_price = 0.0
+                s.entry_size = 0.0
+                s.current_sl = 0.0
+                s.take_profit = 0.0
+                self._last_exchange_sl = 0.0
+                self._save_state()
+            elif abs(actual_size - s.entry_size) / max(s.entry_size, 1e-9) > 0.1:
+                # Size differs by >10% — log warning but keep running
+                logger.warning(
+                    f"[{self.symbol}] Size mismatch: state={s.entry_size} exchange={actual_size} "
+                    f"— updating to exchange value"
+                )
+                s.entry_size = actual_size
+                self._save_state()
+            else:
+                logger.info(
+                    f"[{self.symbol}] Position verified: {s.position_side} @ {s.entry_price} | "
+                    f"SL={s.current_sl:.2f} TP={s.take_profit:.2f}"
+                )
 
         # NOW safe to allow WS callbacks (on_price_update, etc.)
         self._warmup_done = True
@@ -416,66 +472,26 @@ class StrategyEngine:
             await self._on_position_closed(candles)
 
         elif pos is not None and not self.state.in_position:
-            # Position exists but state says flat.
-            # Check if this is an orphan from race condition (e.g. SL trigger created reverse)
+            # Position exists but state says flat — this is ALWAYS an orphan.
+            # Bot only creates positions through _enter_position() which sets state.
+            # If state is flat, this position came from a race condition, crash, or manual trade.
             szi = float(pos["szi"])
             entry_px = float(pos["entryPx"])
             size = abs(szi)
+            side_str = "long" if szi > 0 else "short"
             
-            # If position appeared very recently (within last 2 candle periods) and we didn't
-            # place it, it's likely an orphan. Close it.
-            expected_size = self.trader.get_sz_decimals(self.symbol)  # just need a reference
-            # Heuristic: if we have recent trade history (last_exit_bar close to current bar),
-            # this is likely an orphan from SL/TP race condition
-            bars_since_exit = self.state.bar_counter - self.state.last_exit_bar
-            if bars_since_exit <= 1:
-                logger.warning(
-                    f"[{self.symbol}] Orphan position detected (exited {bars_since_exit} bars ago): "
-                    f"{'long' if szi > 0 else 'short'} {size} @ {entry_px} — closing"
-                )
-                await self.trader.cancel_all_orders(self.symbol)
-                try:
-                    await asyncio.to_thread(
-                        self.trader.exchange.market_close, self.symbol
-                    )
-                    logger.info(f"✅ [{self.symbol}] Orphan position closed.")
-                except Exception as e:
-                    logger.error(f"❌ [{self.symbol}] Failed to close orphan: {e}")
-                return
-
-            # Legitimate position (e.g., manual trade or bot restart with stale state)
-            s = self.state
-            szi = float(pos["szi"])
-            s.in_position = True
-            s.position_side = "long" if szi > 0 else "short"
-            s.entry_price = float(pos["entryPx"])
-            s.entry_size = abs(szi)
-
-            # Compute SL/TP from current ATR (like a fresh entry)
-            atr = compute_atr(candles, STRATEGY.ATR_LENGTH)
-            if atr > 0:
-                s.sl_distance = STRATEGY.SL_MULTIPLIER * atr
-                if s.position_side == "long":
-                    s.initial_sl = s.entry_price - s.sl_distance
-                    s.current_sl = s.initial_sl
-                    s.take_profit = s.entry_price + s.sl_distance * STRATEGY.RR_RATIO
-                    s.zone_level = s.bull_ob if s.bull_ob > 0 else s.entry_price
-                else:
-                    s.initial_sl = s.entry_price + s.sl_distance
-                    s.current_sl = s.initial_sl
-                    s.take_profit = s.entry_price - s.sl_distance * STRATEGY.RR_RATIO
-                    s.zone_level = s.bear_ob if s.bear_ob > 0 else s.entry_price
-
-            s.entry_source = "OB"  # unknown, assume OB
-            s.breakeven_applied = False
-            s.trailing_active = False
-            s.entry_time = time.time()
-            self._save_state()
-
             logger.warning(
-                f"[{self.symbol}] Resynced position: {s.position_side} @ {s.entry_price} | "
-                f"SL={s.current_sl:.2f} | TP={s.take_profit:.2f}"
+                f"[{self.symbol}] Orphan position detected: {side_str} {size} @ {entry_px} "
+                f"(state=FLAT) — closing immediately"
             )
+            await self.trader.cancel_all_orders(self.symbol)
+            try:
+                await asyncio.to_thread(
+                    self.trader.exchange.market_close, self.symbol
+                )
+                logger.info(f"✅ [{self.symbol}] Orphan position closed.")
+            except Exception as e:
+                logger.error(f"❌ [{self.symbol}] Failed to close orphan: {e}")
 
     async def _on_position_closed(self, candles: List[dict], exit_price: float = None):
         """Handle position closure — adjust risk, save trade."""
@@ -755,6 +771,7 @@ class StrategyEngine:
         s.entry_time = time.time()
         self._last_exchange_sl = sl_price  # Exchange has initial SL from open_position
         self._last_sl_exchange_update = 0.0  # Reset throttle for new position
+        self._emergency_first_seen = 0  # Reset emergency timer for new position
         # Store entry analytics for data-driven tuning
         s._entry_ema_dev = ema_deviation_pct
         s._entry_atr_pct = atr_pct
@@ -771,8 +788,8 @@ class StrategyEngine:
         
         Responsibilities:
         - Compute trailing SL / breakeven (update internal state)
-        - Emergency-only backup: market-close ONLY if price blows past SL by 2x
-          and exchange trigger hasn't fired in 30 sec (exchange is the primary executor)
+        - Emergency backup: if price is past SL for >10s, force market-close
+          (exchange trigger order is primary; this is a safety net)
         
         We do NOT market-close on normal SL/TP hit — the exchange trigger order
         handles that. This avoids race conditions where both fire simultaneously
@@ -782,29 +799,28 @@ class StrategyEngine:
         if not self._warmup_done or not s.in_position or self._lock:
             return None
 
-        # ── Emergency backup: only if price BLEW PAST SL significantly ──
-        # Exchange should have closed already. If not, something is very wrong.
-        emergency_margin = s.sl_distance * 0.5  # 50% past SL = emergency
+        # ── Emergency backup: price past SL for >10 seconds ──
+        # Exchange SL trigger should fire almost instantly. If price stays
+        # past SL for 10s, something is wrong — force market close.
         if s.position_side == "long":
-            emergency_sl = s.current_sl - emergency_margin
-            emergency_hit = price <= emergency_sl
+            sl_breached = price <= s.current_sl
+            breach_amount = s.current_sl - price if sl_breached else 0
         else:
-            emergency_sl = s.current_sl + emergency_margin
-            emergency_hit = price >= emergency_sl
+            sl_breached = price >= s.current_sl
+            breach_amount = price - s.current_sl if sl_breached else 0
 
-        if emergency_hit:
-            # Check if we've been past SL for a while (exchange should have fired)
+        if sl_breached:
             now = time.time()
             if self._emergency_first_seen == 0:
                 self._emergency_first_seen = now
                 logger.warning(
-                    f"⚠️ [{self.symbol}] Price {price:.2f} blew past SL {s.current_sl:.2f} "
-                    f"by {emergency_margin:.2f} — waiting for exchange trigger..."
+                    f"⚠️ [{self.symbol}] Price {price:.2f} past SL {s.current_sl:.2f} "
+                    f"by {breach_amount:.2f} — exchange should close within 10s"
                 )
                 return None
 
             elapsed = now - self._emergency_first_seen
-            if elapsed >= 30:  # 30 seconds past emergency = exchange failed
+            if elapsed >= 10:  # 10 seconds past SL = exchange failed
                 logger.error(
                     f"🆘 [{self.symbol}] EMERGENCY CLOSE: price={price:.2f} past SL={s.current_sl:.2f} "
                     f"for {elapsed:.0f}s — exchange trigger failed!"
@@ -813,7 +829,13 @@ class StrategyEngine:
                 return self._close_and_handle(price)
             return None
         else:
-            # Reset emergency timer if price came back
+            # Reset emergency timer if price came back within SL
+            if self._emergency_first_seen > 0:
+                elapsed = time.time() - self._emergency_first_seen
+                logger.info(
+                    f"[{self.symbol}] Price {price:.2f} back within SL {s.current_sl:.2f} "
+                    f"— emergency timer reset ({elapsed:.1f}s)"
+                )
             self._emergency_first_seen = 0
 
         # ── Compute breakeven & trailing (internal state only) ──
