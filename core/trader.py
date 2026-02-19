@@ -8,6 +8,7 @@ import asyncio
 import logging
 import os
 import secrets
+import time
 from typing import Optional, Dict, List
 
 from hyperliquid.utils.types import Cloid
@@ -26,6 +27,12 @@ class HLTrader:
         self.notifier = Notifier()
         self.exchange = self.signer.exchange
         self.info = self.signer.get_info()
+        self._user_state_cache = None
+        self._user_state_ts = 0.0
+        self._user_state_ttl = 5.0  # cache TTL in seconds
+        self._meta_cache = None
+        self._meta_ts = 0.0
+        self._meta_ttl = 300.0  # meta rarely changes
         self._setup_logger()
 
     # ── logging ──────────────────────────────────────────────
@@ -74,10 +81,32 @@ class HLTrader:
             raise ValueError(f"No price for {symbol}")
         return float(px)
 
+    # ── cached helpers ────────────────────────────────────────────
+    def _get_user_state_cached(self) -> dict:
+        """Cached user_state — avoids repeated slow REST calls within a tick."""
+        now = time.time()
+        if self._user_state_cache is None or (now - self._user_state_ts) > self._user_state_ttl:
+            self._user_state_cache = self.signer.get_user_state()
+            self._user_state_ts = now
+        return self._user_state_cache
+
+    def _get_meta_cached(self) -> dict:
+        """Cached meta — szDecimals etc rarely change."""
+        now = time.time()
+        if self._meta_cache is None or (now - self._meta_ts) > self._meta_ttl:
+            self._meta_cache = self.info.meta()
+            self._meta_ts = now
+        return self._meta_cache
+
+    def invalidate_cache(self):
+        """Force refresh on next call (after order execution, etc)."""
+        self._user_state_cache = None
+        self._user_state_ts = 0.0
+
     # ── account ──────────────────────────────────────────────
     def get_equity(self) -> float:
         """Returns total equity (spot USDC preferred)."""
-        state = self.signer.get_user_state()
+        state = self._get_user_state_cached()
         return float(state["marginSummary"]["accountValue"])
 
     def get_position(self, symbol: str) -> Optional[Dict]:
@@ -85,7 +114,7 @@ class HLTrader:
         Returns current position dict for given symbol, or None.
         Keys: coin, szi, entryPx, positionValue, unrealizedPnl, ...
         """
-        state = self.signer.get_user_state()
+        state = self._get_user_state_cached()
         for ap in state.get("assetPositions", []):
             p = ap["position"]
             if p["coin"] == symbol and float(p["szi"]) != 0:
@@ -93,7 +122,7 @@ class HLTrader:
         return None
 
     def get_sz_decimals(self, symbol: str) -> int:
-        meta = self.info.meta()
+        meta = self._get_meta_cached()
         for asset in meta["universe"]:
             if asset["name"] == symbol:
                 return asset["szDecimals"]
@@ -183,6 +212,9 @@ class HLTrader:
         entry_price = self._extract_avg_price(statuses) or price
         filled_size = self._extract_filled_size(statuses) or size
         logger.info(f"✅ Filled {side.upper()} {symbol} @ {entry_price} | Size={filled_size}")
+
+        # Invalidate cache — position state changed
+        self.invalidate_cache()
 
         # Wait briefly for exchange state to settle
         await asyncio.sleep(0.5)
@@ -302,6 +334,7 @@ class HLTrader:
 
     async def close_position(self, symbol: str) -> bool:
         """Market-close current position for given symbol."""
+        self.invalidate_cache()  # ensure fresh read
         pos = self.get_position(symbol)
         if not pos:
             logger.info(f"No position to close for {symbol}.")

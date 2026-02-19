@@ -191,7 +191,6 @@ class StrategyEngine:
         self.STATE_FILE = os.path.join(GLOBAL.DATA_DIR, f"state_{symbol}.json")
         self._load_state()
         self._last_candle_t = 0
-        self._skip_entry_after_warmup = False  # True after warmup, cleared on first new candle
         self._warmup_done = False  # Blocks all WS callbacks until warmup + sync complete
         self._lock = False  # Simple reentrance guard for async operations
         self._emergency_first_seen = 0.0  # Emergency backup timer
@@ -288,7 +287,6 @@ class StrategyEngine:
         # Store last CLOSED candle timestamp (candles[-2], since candles[-1] is forming)
         # This ensures the first WS candle close is detected as a new candle
         self._last_candle_t = candles[-2]["t"] if len(candles) >= 2 else candles[-1]["t"]
-        self._skip_entry_after_warmup = True  # Don't trade on stale historical signal
 
         # Fix cooldown: last_exit_bar from previous session may be > new bar_counter
         # which would block entries for hours until bar_counter catches up
@@ -351,12 +349,6 @@ class StrategyEngine:
         self._last_candle_t = closed_t
         self.state.bar_counter += 1
 
-        # Consume warmup-skip flag on the FIRST new candle (regardless of position state)
-        # This prevents the flag from surviving across multiple candles while in position
-        is_first_after_warmup = self._skip_entry_after_warmup
-        if is_first_after_warmup:
-            self._skip_entry_after_warmup = False
-
         # Use all candles up to and including last closed (exclude current unclosed)
         closed_candles = candles[:-1]
 
@@ -371,11 +363,7 @@ class StrategyEngine:
             await self._manage_position_on_candle(closed_candles)
             return
 
-        # 4. If flat → check entry signals (skip only the very first candle after warmup)
-        if is_first_after_warmup:
-            logger.info(f"[{self.symbol}] First candle after warmup — skipping entry check, levels updated.")
-            return
-
+        # 4. If flat → check entry signals
         await self._check_entries(closed_candles)
 
     # ── indicator update ─────────────────────────────────────
