@@ -416,7 +416,34 @@ class StrategyEngine:
             await self._on_position_closed(candles)
 
         elif pos is not None and not self.state.in_position:
-            # Position exists but state says flat — resync with computed SL/TP
+            # Position exists but state says flat.
+            # Check if this is an orphan from race condition (e.g. SL trigger created reverse)
+            szi = float(pos["szi"])
+            entry_px = float(pos["entryPx"])
+            size = abs(szi)
+            
+            # If position appeared very recently (within last 2 candle periods) and we didn't
+            # place it, it's likely an orphan. Close it.
+            expected_size = self.trader.get_sz_decimals(self.symbol)  # just need a reference
+            # Heuristic: if we have recent trade history (last_exit_bar close to current bar),
+            # this is likely an orphan from SL/TP race condition
+            bars_since_exit = self.state.bar_counter - self.state.last_exit_bar
+            if bars_since_exit <= 1:
+                logger.warning(
+                    f"[{self.symbol}] Orphan position detected (exited {bars_since_exit} bars ago): "
+                    f"{'long' if szi > 0 else 'short'} {size} @ {entry_px} — closing"
+                )
+                await self.trader.cancel_all_orders(self.symbol)
+                try:
+                    await asyncio.to_thread(
+                        self.trader.exchange.market_close, self.symbol
+                    )
+                    logger.info(f"✅ [{self.symbol}] Orphan position closed.")
+                except Exception as e:
+                    logger.error(f"❌ [{self.symbol}] Failed to close orphan: {e}")
+                return
+
+            # Legitimate position (e.g., manual trade or bot restart with stale state)
             s = self.state
             szi = float(pos["szi"])
             s.in_position = True
@@ -503,6 +530,10 @@ class StrategyEngine:
             "risk_after": round(s.current_risk, 2),
             "entry_time": s.entry_time,
             "exit_time": time.time(),
+            # Data-driven tuning fields
+            "ema_deviation_pct": round(getattr(s, '_entry_ema_dev', 0), 3),
+            "atr_pct": round(getattr(s, '_entry_atr_pct', 0), 3),
+            "ema50_at_entry": round(getattr(s, '_entry_ema50', 0), 2),
         })
 
         # Notify
@@ -649,6 +680,12 @@ class StrategyEngine:
         s = self.state
         entry_price = candles[-1]["c"]  # approximate entry price
 
+        # Data-driven metrics: save for post-analysis
+        closes = [x["c"] for x in candles]
+        ema50 = compute_ema(closes, 50)
+        ema_deviation_pct = ((entry_price - ema50) / ema50) * 100 if ema50 > 0 else 0
+        atr_pct = (atr / entry_price) * 100 if entry_price > 0 else 0
+
         # SL & TP (Pine: slDistance = slMultiplier * atr)
         if side == "long":
             sl_price = entry_price - sl_distance
@@ -718,6 +755,10 @@ class StrategyEngine:
         s.entry_time = time.time()
         self._last_exchange_sl = sl_price  # Exchange has initial SL from open_position
         self._last_sl_exchange_update = 0.0  # Reset throttle for new position
+        # Store entry analytics for data-driven tuning
+        s._entry_ema_dev = ema_deviation_pct
+        s._entry_atr_pct = atr_pct
+        s._entry_ema50 = ema50
 
         self._save_state()
         logger.info(f"✅ [{self.symbol}] Position opened: {side.upper()} @ {s.entry_price}")
@@ -888,49 +929,71 @@ class StrategyEngine:
     async def _close_and_handle(self, exit_price: float):
         """Close position via market and handle state update.
         
-        CRITICAL: Cancel trigger orders FIRST to prevent race condition
-        where both bot market-close and exchange SL trigger execute,
-        resulting in a reverse position.
+        Strategy: close FIRST (fastest path), then clean up orders,
+        then verify no reverse. Speed > order cancellation priority
+        because the SL trigger may fire at any moment.
         """
         if self._lock:
             return
         self._lock = True
         try:
-            # 1. Cancel all trigger orders FIRST to prevent double execution
+            # 1. Close position IMMEDIATELY via market_close (SDK handles reduce-only)
+            try:
+                result = await asyncio.to_thread(
+                    self.trader.exchange.market_close, self.symbol
+                )
+                if result.get("status") == "ok":
+                    logger.info(f"[{self.symbol}] Emergency market_close executed.")
+                else:
+                    logger.error(f"[{self.symbol}] market_close failed: {result}")
+            except Exception as e:
+                logger.error(f"[{self.symbol}] market_close error: {e}")
+
+            # 2. Cancel ALL remaining trigger orders (SL/TP) — they're orphans now
             await self.trader.cancel_all_orders(self.symbol)
-            
-            # 2. Close position via market
-            closed = await self.trader.close_position(self.symbol)
-            if closed:
-                # 3. Safety: verify no accidental reverse position from race condition
-                await asyncio.sleep(0.5)
-                await self._verify_no_reverse_position()
-                await self._on_position_closed([], exit_price=exit_price)
-            else:
-                logger.error(f"[{self.symbol}] Failed to close! Will retry.")
+
+            # 3. Wait for settlement, then verify no reverse position
+            await asyncio.sleep(1.0)
+            self.trader.invalidate_cache()
+            await self._verify_no_reverse_position()
+
+            # 4. Double-check: cancel any orders that appeared from race
+            await self.trader.cancel_all_orders(self.symbol)
+
+            await self._on_position_closed([], exit_price=exit_price)
         finally:
             self._lock = False
 
     async def _verify_no_reverse_position(self):
-        """Check for accidental reverse position from SL/TP race condition."""
-        pos = self.trader.get_position(self.symbol)
-        if pos is not None:
+        """Check for accidental reverse position from SL/TP race condition.
+        Retries up to 3 times with fresh exchange reads."""
+        for attempt in range(3):
+            self.trader.invalidate_cache()
+            pos = self.trader.get_position(self.symbol)
+            if pos is None:
+                return  # Clean — no position
             szi = float(pos.get("szi", 0))
-            if szi != 0:
-                logger.warning(
-                    f"⚠️ [{self.symbol}] Reverse position detected! size={szi} "
-                    f"— closing immediately (SL/TP race condition)"
+            if szi == 0:
+                return  # Clean
+            logger.warning(
+                f"⚠️ [{self.symbol}] Reverse position detected! size={szi} "
+                f"— closing (attempt {attempt + 1}/3)"
+            )
+            await self.trader.cancel_all_orders(self.symbol)
+            try:
+                await asyncio.to_thread(
+                    self.trader.exchange.market_close, self.symbol
                 )
-                await self.trader.cancel_all_orders(self.symbol)
-                try:
-                    is_buy = szi < 0
-                    await asyncio.to_thread(
-                        self.trader.exchange.market_open,
-                        self.symbol, is_buy, abs(szi), None, 0.01,
-                    )
-                    logger.info(f"✅ [{self.symbol}] Reverse position closed.")
-                except Exception as e:
-                    logger.error(f"❌ [{self.symbol}] Failed to close reverse: {e}")
+                logger.info(f"✅ [{self.symbol}] Reverse position closed.")
+            except Exception as e:
+                logger.error(f"❌ [{self.symbol}] Failed to close reverse: {e}")
+            await asyncio.sleep(1.0)
+        
+        # Final check
+        self.trader.invalidate_cache()
+        pos = self.trader.get_position(self.symbol)
+        if pos and float(pos.get("szi", 0)) != 0:
+            logger.error(f"❌ [{self.symbol}] STILL have reverse position after 3 attempts!")
 
     async def _manage_position_on_candle(self, candles: List[dict]):
         """

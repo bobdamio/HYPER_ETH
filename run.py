@@ -208,13 +208,19 @@ async def main():
     WS_STALE_THRESHOLD = 45        # consider WS dead if no price for 45s
     ws_backoff = 2                 # exponential backoff: starts at 2s
     WS_BACKOFF_MAX = 30            # max backoff cap
+    EMERGENCY_REST_INTERVAL = 3    # aggressive REST polling when WS dead (seconds)
+    SILENCE_CLOSE_THRESHOLD = 60   # close all positions if zero updates for this long
+    ws_emergency_mode = False      # True when WS is dead → aggressive REST polling
+    ws_recovery_pongs = 0          # count successful WS pongs after recovery
 
     while RUNNING:
         try:
             now = time.time()
 
-            # ── Fallback: REST candle check (safety net if WS candle missed a close)
-            if now - last_fallback_check >= FALLBACK_CHECK_INTERVAL:
+            # ── Fallback: REST candle check ──
+            # Normal mode: every 60s. Emergency mode (WS dead): every 3s
+            fallback_interval = EMERGENCY_REST_INTERVAL if ws_emergency_mode else FALLBACK_CHECK_INTERVAL
+            if now - last_fallback_check >= fallback_interval:
                 last_fallback_check = now
                 for sym in symbols:
                     try:
@@ -251,7 +257,35 @@ async def main():
                     ws_dead = True
 
                 if ws_dead:
+                    if not ws_emergency_mode:
+                        ws_emergency_mode = True
+                        ws_recovery_pongs = 0
+                        logger.warning("🚨 Entering EMERGENCY REST mode (polling every 3s)")
                     age = now - ws._last_price_time if ws._last_price_time > 0 else -1
+
+                    # ── Flash crash RED BUTTON: 60s total silence + has position → close all ──
+                    if age >= SILENCE_CLOSE_THRESHOLD:
+                        for sym in symbols:
+                            eng = engines[sym]
+                            if eng.state.in_position:
+                                logger.error(
+                                    f"🚨 [{sym}] RED BUTTON: {age:.0f}s silence — "
+                                    f"closing all to protect capital!"
+                                )
+                                try:
+                                    await asyncio.to_thread(
+                                        trader.exchange.market_close, sym
+                                    )
+                                    await trader.cancel_all_orders(sym)
+                                    trader.invalidate_cache()
+                                    await eng._on_position_closed([], exit_price=0)
+                                    await notifier.send(
+                                        f"🚨 *{sym} RED BUTTON CLOSE*\n"
+                                        f"No data for {age:.0f}s — position closed for safety"
+                                    )
+                                except Exception as e:
+                                    logger.error(f"[{sym}] Red button close failed: {e}")
+
                     logger.warning(
                         f"⚠️ WebSocket dead (connected={ws.connected}, "
                         f"last_price={age:.0f}s ago) — reconnecting (backoff={ws_backoff}s)..."
@@ -270,25 +304,57 @@ async def main():
                                 pass
                         logger.info("🔌 WebSocket reconnected + candle buffers re-seeded")
 
-                        # Post-reconnect SL sanity: verify exchange SL orders for open positions
+                        # Post-reconnect SL sanity: verify SL orders actually exist on exchange
                         for sym in symbols:
                             eng = engines[sym]
                             s = eng.state
                             if s.in_position and s.current_sl > 0:
                                 try:
-                                    # Force re-sync by resetting dedup tracker
-                                    eng._last_exchange_sl = 0.0
-                                    await eng._update_exchange_sl()
-                                    logger.info(
-                                        f"🛡️ [{sym}] Post-reconnect SL verified: {s.current_sl:.2f}"
+                                    # Check actual orders on exchange
+                                    open_ords = trader.info.frontend_open_orders(
+                                        trader.signer.address
                                     )
+                                    sym_sl_orders = [
+                                        o for o in open_ords
+                                        if o.get("coin") == sym
+                                        and "Stop" in o.get("orderType", "")
+                                    ]
+                                    if not sym_sl_orders:
+                                        logger.warning(
+                                            f"🚨 [{sym}] NO SL order on exchange! "
+                                            f"Re-placing SL={s.current_sl:.2f} + TP={s.take_profit:.2f}"
+                                        )
+                                        eng._last_exchange_sl = 0.0
+                                        await eng._update_exchange_sl()
+                                    else:
+                                        # Verify SL price matches
+                                        exch_sl = float(sym_sl_orders[0].get("triggerPx", 0))
+                                        if abs(exch_sl - s.current_sl) > 0.5:
+                                            logger.warning(
+                                                f"⚠️ [{sym}] Exchange SL={exch_sl:.2f} != "
+                                                f"bot SL={s.current_sl:.2f} — re-syncing"
+                                            )
+                                            eng._last_exchange_sl = 0.0
+                                            await eng._update_exchange_sl()
+                                        else:
+                                            logger.info(
+                                                f"🛡️ [{sym}] SL verified on exchange: {exch_sl:.2f}"
+                                            )
                                 except Exception as e:
-                                    logger.error(f"[{sym}] Post-reconnect SL sync failed: {e}")
+                                    logger.error(f"[{sym}] Post-reconnect SL check failed: {e}")
 
                         ws_backoff = 2  # reset backoff on success
                     except Exception as e:
                         logger.error(f"WS reconnect failed: {e}")
                         ws_backoff = min(ws_backoff * 2, WS_BACKOFF_MAX)  # exponential backoff
+                else:
+                    # WS is alive
+                    if ws_emergency_mode:
+                        ws_recovery_pongs += 1
+                        if ws_recovery_pongs >= 3:
+                            ws_emergency_mode = False
+                            ws_recovery_pongs = 0
+                            logger.info("✅ WebSocket recovered — exiting emergency REST mode")
 
             # Heartbeat every 2 minutes
             if now - last_heartbeat >= HEARTBEAT_INTERVAL:
