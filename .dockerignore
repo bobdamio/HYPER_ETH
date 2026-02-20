@@ -1,0 +1,7 @@
+data/
+logs/
+__pycache__/
+*.pyc
+.git/
+.env
+*.md
