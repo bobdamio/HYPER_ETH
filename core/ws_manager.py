@@ -171,11 +171,18 @@ class HLWebSocketManager:
     def _on_order_update(self, msg: dict):
         """
         OrderUpdates message: {'channel': 'orderUpdates', 'data': [...]}
-        Each item has: coin, oid, side, sz, limitPx, orderType, status, etc.
+        Each item: {'order': {'coin': 'ETH', 'side': 'A', ...}, 'status': 'filled'|'canceled'|...}
         Called from WS thread.
         """
         try:
             data = msg.get("data", [])
+            logger.info(
+                f"📋 WS OrderUpdate received: {len(data)} item(s) — "
+                + ", ".join(
+                    f"{item.get('order', {}).get('coin', '?')}:{item.get('status', '?')}"
+                    for item in data
+                )
+            )
             for order in data:
                 for cb in self._on_order_cbs:
                     try:

@@ -80,7 +80,8 @@ def make_order_handler(engines: dict):
     Called from WS thread — returns coroutine for async handling.
     """
     def on_order(order_data: dict):
-        coin = order_data.get("coin", "")
+        # HL format: coin is nested inside order_data["order"]["coin"]
+        coin = order_data.get("order", {}).get("coin", "")
         engine = engines.get(coin)
         if engine is None:
             return None

@@ -924,36 +924,47 @@ class StrategyEngine:
     async def on_order_triggered(self, order_data: dict):
         """
         Called from WebSocket when an order update comes in.
-        Detects when our SL/TP triggered → handle position close.
+        HL format: {'order': {'coin': 'ETH', 'side': 'A', 'limitPx': ..., 'sz': ..., 'oid': ...}, 
+                    'status': 'filled'|'canceled'|'triggered'|..., 'statusTimestamp': ...}
         """
         if not self._warmup_done:
             return
 
-        coin = order_data.get("coin", "")
+        # HL nests order details inside 'order' dict
+        order_info = order_data.get("order", {})
+        coin = order_info.get("coin", "")
         if coin != self.symbol:
             return
 
         status = order_data.get("status", "")
-        order_type = order_data.get("orderType", "")
+        oid = order_info.get("oid", "?")
+        side = order_info.get("side", "?")
+        limit_px = order_info.get("limitPx", "?")
+        cloid = order_info.get("cloid", "")
 
-        # Debug: log every order update we receive to diagnose SL/TP fill detection
         logger.info(
-            f"📋 [{self.symbol}] OrderUpdate: status={status} type={order_type} "
-            f"data={order_data}"
+            f"📋 [{self.symbol}] OrderUpdate: status={status} side={side} "
+            f"px={limit_px} oid={oid} cloid={cloid}"
         )
 
-        # HL trigger orders: when a tpsl triggers, it may report as "triggered" first,
-        # then a market fill. Check for both "filled" trigger types and "triggered" status.
-        is_sl_tp_fill = (
-            (status == "filled" and ("Stop" in order_type or "Take Profit" in order_type or "Trigger" in order_type))
-            or (status == "triggered")
-            or (status == "filled" and order_data.get("reduceOnly", False))
+        # HL sends 'filled' when a tpsl trigger order executes.
+        # For limit orders it also sends 'filled'. We detect SL/TP by:
+        # 1. The order was placed by us as reduce-only (SL/TP always are)
+        # 2. Status is 'filled' and we're in a position
+        # 3. Side is opposite to our position (sell for long, buy for short)
+        is_close_fill = (
+            status == "filled"
+            and self.state.in_position
+            and (
+                (self.state.position_side == "long" and side == "A")  # sell = close long
+                or (self.state.position_side == "short" and side == "B")  # buy = close short
+            )
         )
 
-        if is_sl_tp_fill:
+        if is_close_fill:
             logger.info(
-                f"⚡ [{self.symbol}] Exchange {order_type} filled! "
-                f"px={order_data.get('triggerPx', '?')}"
+                f"⚡ [{self.symbol}] Exchange SL/TP filled! "
+                f"status={status} side={side} px={limit_px} oid={oid}"
             )
             # Position was closed by exchange trigger — clean up remaining orders + state
             if self.state.in_position and not self._lock:
@@ -963,7 +974,8 @@ class StrategyEngine:
                     # Safety: wait briefly then verify no ghost position
                     await asyncio.sleep(0.5)
                     await self._verify_no_reverse_position()
-                    exit_price = float(order_data.get("triggerPx", 0)) or float(order_data.get("px", 0))
+                    # HL order format: price is in order_data["order"]["limitPx"]
+                    exit_price = float(order_info.get("limitPx", 0))
                     await self._on_position_closed([], exit_price=exit_price)
                 finally:
                     self._lock = False
