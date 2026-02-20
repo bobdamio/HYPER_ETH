@@ -971,7 +971,10 @@ class StrategyEngine:
                 result = await asyncio.to_thread(
                     self.trader.exchange.market_close, self.symbol
                 )
-                if result.get("status") == "ok":
+                if result is None:
+                    # SDK returns None when no position to close (exchange SL already triggered)
+                    logger.info(f"[{self.symbol}] market_close returned None — position already closed by exchange.")
+                elif result.get("status") == "ok":
                     logger.info(f"[{self.symbol}] Emergency market_close executed.")
                 else:
                     logger.error(f"[{self.symbol}] market_close failed: {result}")
