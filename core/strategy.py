@@ -936,8 +936,21 @@ class StrategyEngine:
         status = order_data.get("status", "")
         order_type = order_data.get("orderType", "")
 
-        # HL order statuses: 'filled', 'canceled', 'triggered', etc.
-        if status == "filled" and ("Stop" in order_type or "Take Profit" in order_type):
+        # Debug: log every order update we receive to diagnose SL/TP fill detection
+        logger.info(
+            f"📋 [{self.symbol}] OrderUpdate: status={status} type={order_type} "
+            f"data={order_data}"
+        )
+
+        # HL trigger orders: when a tpsl triggers, it may report as "triggered" first,
+        # then a market fill. Check for both "filled" trigger types and "triggered" status.
+        is_sl_tp_fill = (
+            (status == "filled" and ("Stop" in order_type or "Take Profit" in order_type or "Trigger" in order_type))
+            or (status == "triggered")
+            or (status == "filled" and order_data.get("reduceOnly", False))
+        )
+
+        if is_sl_tp_fill:
             logger.info(
                 f"⚡ [{self.symbol}] Exchange {order_type} filled! "
                 f"px={order_data.get('triggerPx', '?')}"
