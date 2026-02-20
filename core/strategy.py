@@ -3,6 +3,7 @@ HYPER_ETH — Strategy Engine
 Exact translation of ETH_main.pine (OB + FVG + Smooth Dynamic Risk).One instance per symbol."""
 
 import asyncio
+import datetime
 import json
 import logging
 import os
@@ -237,7 +238,8 @@ class StrategyEngine:
         fvg_count = 0
 
         # Walk through candles sequentially, like Pine processes each bar
-        for i in range(min_bars, len(candles)):
+        # Stop at len-1: candles[-1] is the forming (unclosed) candle — skip it
+        for i in range(min_bars, len(candles) - 1):
             bar_num = i  # use candle index as bar number during warmup
             window = candles[:i + 1]  # candles[0..i] — all bars up to current
 
@@ -282,8 +284,8 @@ class StrategyEngine:
                     s.bear_fvg_bar = bar_num
                     fvg_count += 1
 
-        # Set bar_counter to match candle count so FVG validity works correctly
-        s.bar_counter = len(candles)
+        # Set bar_counter to match closed candle count (excluding forming candle)
+        s.bar_counter = len(candles) - 1
         # Store last CLOSED candle timestamp (candles[-2], since candles[-1] is forming)
         # This ensures the first WS candle close is detected as a new candle
         self._last_candle_t = candles[-2]["t"] if len(candles) >= 2 else candles[-1]["t"]
@@ -733,8 +735,13 @@ class StrategyEngine:
         if notional > RISK.MAX_POSITION_USD:
             size_coin = RISK.MAX_POSITION_USD / entry_price
 
+        # Add candle timestamp for debugging (convert epoch ms to human time)
+        candle_t_ms = candles[-1]["t"]
+        candle_time_str = datetime.datetime.utcfromtimestamp(candle_t_ms / 1000).strftime("%H:%M")
+
         logger.info(
             f"📊 [{self.symbol}] Signal: {side.upper()} {entry_source} | "
+            f"Candle={candle_time_str} bar={s.bar_counter} | "
             f"Price≈{entry_price:.2f} | SL={sl_price:.2f} | TP={tp_price:.2f} | "
             f"Size={size_coin:.4f} (${size_coin * entry_price:.2f}) | "
             f"Risk={s.current_risk:.1f}%"
