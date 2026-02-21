@@ -198,6 +198,7 @@ class StrategyEngine:
         self._last_sl_exchange_update = 0.0  # Throttle: last time we updated exchange SL
         self._sl_update_interval = 15  # Min seconds between exchange SL updates
         self._last_exchange_sl = 0.0  # Last SL value sent to exchange (dedup)
+        self._fill_cache: Dict[int, dict] = {}  # oid → fill data from UserFills WS
 
     # ── persistence ──────────────────────────────────────────
     def _load_state(self):
@@ -939,6 +940,107 @@ class StrategyEngine:
         except Exception as e:
             logger.error(f"[{self.symbol}] Failed to update exchange SL: {e}")
 
+    def on_user_fill(self, fill: dict):
+        """
+        Called synchronously from WS thread when a UserFills message arrives.
+        Stores fill data in cache keyed by oid for later lookup.
+        The 'px' field is the ACTUAL execution price.
+        """
+        coin = fill.get("coin", "")
+        if coin != self.symbol:
+            return
+        oid = fill.get("oid")
+        if oid is not None:
+            self._fill_cache[oid] = fill
+            logger.info(
+                f"💰 [{self.symbol}] Fill cached: oid={oid} px={fill.get('px')} "
+                f"dir={fill.get('dir')} pnl={fill.get('closedPnl')}"
+            )
+            # Keep cache small — remove entries older than 60s
+            now_ms = int(time.time() * 1000)
+            stale = [k for k, v in self._fill_cache.items()
+                     if now_ms - v.get("time", now_ms) > 60_000]
+            for k in stale:
+                del self._fill_cache[k]
+
+    async def _get_fill_price(self, oid) -> float:
+        """
+        Get actual fill price for an order.
+        
+        Priority:
+          1. WS UserFills cache (instant, no API call)
+          2. REST user_fills_by_time fallback
+          3. Mid-market price fallback
+        
+        WS orderUpdates 'limitPx' for trigger orders is the far-limit
+        (set 10% away from trigger for guaranteed fill), NOT the actual
+        execution price. We MUST use the fill px instead.
+        """
+        oid_int = int(oid) if not isinstance(oid, int) else oid
+
+        # 1. Check WS fill cache (should be populated by userFills subscription)
+        cached = self._fill_cache.get(oid_int)
+        if cached:
+            real_px = float(cached["px"])
+            logger.info(
+                f"✅ [{self.symbol}] Fill price from WS cache: {real_px} "
+                f"(oid={oid}, closedPnl={cached.get('closedPnl', '?')})"
+            )
+            return real_px
+
+        # 2. WS fill may not have arrived yet — wait briefly then retry
+        logger.info(f"⏳ [{self.symbol}] Fill not in WS cache yet for oid={oid}, waiting...")
+        await asyncio.sleep(0.3)
+        cached = self._fill_cache.get(oid_int)
+        if cached:
+            real_px = float(cached["px"])
+            logger.info(
+                f"✅ [{self.symbol}] Fill price from WS cache (after wait): {real_px} "
+                f"(oid={oid})"
+            )
+            return real_px
+
+        # 3. REST fallback
+        logger.warning(f"⚠️ [{self.symbol}] WS fill cache miss — trying REST for oid={oid}")
+        try:
+            address = self.trader.signer.address
+            start_ms = int((time.time() - 60) * 1000)
+            fills = await asyncio.get_event_loop().run_in_executor(
+                None,
+                lambda: self.trader.info.user_fills_by_time(address, start_ms)
+            )
+            for fill in reversed(fills):
+                if fill.get("coin") == self.symbol and fill.get("oid") == oid_int:
+                    real_px = float(fill["px"])
+                    logger.info(
+                        f"✅ [{self.symbol}] Fill price from REST: {real_px} (oid={oid})"
+                    )
+                    return real_px
+
+            # oid not found — match by coin + direction
+            expected_dir = "Close Long" if self.state.position_side == "long" else "Close Short"
+            for fill in reversed(fills):
+                if fill.get("coin") == self.symbol and fill.get("dir") == expected_dir:
+                    real_px = float(fill["px"])
+                    logger.warning(
+                        f"⚠️ [{self.symbol}] Fill oid mismatch — using {expected_dir} "
+                        f"fill: px={real_px} (fill_oid={fill.get('oid')}, expected={oid})"
+                    )
+                    return real_px
+
+            logger.warning(f"⚠️ [{self.symbol}] No fill in REST for oid={oid}")
+        except Exception as e:
+            logger.error(f"❌ [{self.symbol}] REST fill lookup failed: {e}")
+
+        # 4. Last resort: mid-market price
+        try:
+            mid = self.trader.get_mark_price(self.symbol)
+            logger.warning(f"⚠️ [{self.symbol}] Using mid-market fallback: {mid}")
+            return mid
+        except Exception:
+            logger.error(f"❌ [{self.symbol}] All fill price lookups failed")
+            return 0.0
+
     async def on_order_triggered(self, order_data: dict):
         """
         Called from WebSocket when an order update comes in.
@@ -992,8 +1094,10 @@ class StrategyEngine:
                     # Safety: wait briefly then verify no ghost position
                     await asyncio.sleep(0.5)
                     await self._verify_no_reverse_position()
-                    # HL order format: price is in order_data["order"]["limitPx"]
-                    exit_price = float(order_info.get("limitPx", 0))
+                    # Get ACTUAL fill price — limitPx in orderUpdates is the far-limit
+                    # for trigger orders (set 10% away), NOT the real execution price.
+                    # Uses WS userFills cache first, REST fallback if needed.
+                    exit_price = await self._get_fill_price(oid)
                     await self._on_position_closed([], exit_price=exit_price)
                 finally:
                     self._lock = False

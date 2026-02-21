@@ -34,6 +34,7 @@ class HLWebSocketManager:
         self._prices: Dict[str, float] = {}
         self._on_price_cbs: list[Callable] = []
         self._on_order_cbs: list[Callable] = []
+        self._on_fill_cbs: list[Callable] = []
         self._on_candle_close_cbs: list[Callable] = []
         self._info: Optional[Info] = None
         self._connected = False
@@ -71,6 +72,13 @@ class HLWebSocketManager:
         )
         logger.info(f"Subscribed to OrderUpdates for {wallet[:10]}...")
 
+        # Subscribe to user fills for real execution prices
+        self._info.subscribe(
+            {"type": "userFills", "user": wallet},
+            self._on_user_fills,
+        )
+        logger.info(f"Subscribed to UserFills for {wallet[:10]}...")
+
         # Subscribe to candle updates for each symbol
         interval = STRATEGY.TIMEFRAME
         for sym in self.symbols:
@@ -107,6 +115,10 @@ class HLWebSocketManager:
     def on_order(self, callback: Callable):
         """Register callback for order updates: callback(order_data)"""
         self._on_order_cbs.append(callback)
+
+    def on_fill(self, callback: Callable):
+        """Register callback for user fills: callback(fill_data)"""
+        self._on_fill_cbs.append(callback)
 
     def on_candle_close(self, callback: Callable):
         """Register callback for candle close: callback(symbol, candles)"""
@@ -193,6 +205,38 @@ class HLWebSocketManager:
                         logger.error(f"Order callback error: {e}")
         except Exception as e:
             logger.error(f"OrderUpdate parse error: {e}")
+
+    def _on_user_fills(self, msg: dict):
+        """
+        UserFills message: {'channel': 'userFills', 'data': {'isSnapshot': bool, 'user': str, 'fills': [...]}}
+        Each fill: {coin, px, sz, side, time, dir, closedPnl, oid, ...}
+        The 'px' field is the ACTUAL execution price (unlike orderUpdates limitPx).
+        Called from WS thread.
+        """
+        try:
+            data = msg.get("data", {})
+            if data.get("isSnapshot"):
+                return  # Skip initial snapshot
+
+            fills = data.get("fills", [])
+            for fill in fills:
+                coin = fill.get("coin", "")
+                if coin not in self.symbols:
+                    continue
+                logger.info(
+                    f"💰 WS UserFill: {coin} {fill.get('dir', '?')} "
+                    f"px={fill.get('px', '?')} sz={fill.get('sz', '?')} "
+                    f"oid={fill.get('oid', '?')} pnl={fill.get('closedPnl', '?')}"
+                )
+                for cb in self._on_fill_cbs:
+                    try:
+                        result = cb(fill)
+                        if asyncio.iscoroutine(result):
+                            asyncio.run_coroutine_threadsafe(result, self.loop)
+                    except Exception as e:
+                        logger.error(f"Fill callback error: {e}")
+        except Exception as e:
+            logger.error(f"UserFills parse error: {e}")
 
     def _on_candle_msg(self, msg: dict):
         """

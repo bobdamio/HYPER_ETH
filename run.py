@@ -89,6 +89,21 @@ def make_order_handler(engines: dict):
     return on_order
 
 
+def make_fill_handler(engines: dict):
+    """
+    Returns a callback for UserFills WS events.
+    Called from WS thread — synchronous, caches fill data for exit price lookup.
+    """
+    def on_fill(fill_data: dict):
+        coin = fill_data.get("coin", "")
+        engine = engines.get(coin)
+        if engine is None:
+            return None
+        engine.on_user_fill(fill_data)
+        return None  # sync — no coroutine needed
+    return on_fill
+
+
 def make_candle_handler(engines: dict):
     """
     Returns a callback for Candle WS close events.
@@ -135,6 +150,7 @@ async def main():
 
     ws.on_price(make_price_handler(engines))
     ws.on_order(make_order_handler(engines))
+    ws.on_fill(make_fill_handler(engines))
     ws.on_candle_close(make_candle_handler(engines))
 
     try:
