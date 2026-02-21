@@ -265,27 +265,53 @@ async def main():
                     age = now - ws._last_price_time if ws._last_price_time > 0 else -1
 
                     # ── Flash crash RED BUTTON: 60s total silence + has position → close all ──
+                    # BUT: if exchange itself is down (502/504), skip — position
+                    # is protected by on-exchange SL, and we can't close anyway.
                     if age >= SILENCE_CLOSE_THRESHOLD:
-                        for sym in symbols:
-                            eng = engines[sym]
-                            if eng.state.in_position:
-                                logger.error(
-                                    f"🚨 [{sym}] RED BUTTON: {age:.0f}s silence — "
-                                    f"closing all to protect capital!"
-                                )
-                                try:
-                                    await asyncio.to_thread(
-                                        trader.exchange.market_close, sym
+                        # Probe exchange health before panic-closing
+                        exchange_reachable = False
+                        try:
+                            await asyncio.to_thread(
+                                trader.info.user_state, trader.signer.address
+                            )
+                            exchange_reachable = True
+                        except Exception as probe_err:
+                            logger.warning(
+                                f"⚠️ RED BUTTON skipped — exchange unreachable: {probe_err}"
+                            )
+
+                        if exchange_reachable:
+                            for sym in symbols:
+                                eng = engines[sym]
+                                if eng.state.in_position:
+                                    logger.error(
+                                        f"🚨 [{sym}] RED BUTTON: {age:.0f}s silence — "
+                                        f"closing all to protect capital!"
                                     )
-                                    await trader.cancel_all_orders(sym)
-                                    trader.invalidate_cache()
-                                    await eng._on_position_closed([], exit_price=0)
-                                    await notifier.send(
-                                        f"🚨 *{sym} RED BUTTON CLOSE*\n"
-                                        f"No data for {age:.0f}s — position closed for safety"
-                                    )
-                                except Exception as e:
-                                    logger.error(f"[{sym}] Red button close failed: {e}")
+                                    try:
+                                        await asyncio.to_thread(
+                                            trader.exchange.market_close, sym
+                                        )
+                                        # Verify position actually closed
+                                        await asyncio.sleep(1)
+                                        pos = await asyncio.to_thread(
+                                            trader.get_position, sym
+                                        )
+                                        if pos is not None and abs(float(pos.get("szi", 0))) > 0:
+                                            logger.error(
+                                                f"[{sym}] RED BUTTON market_close returned "
+                                                f"but position still open — NOT clearing state"
+                                            )
+                                            continue
+                                        await trader.cancel_all_orders(sym)
+                                        trader.invalidate_cache()
+                                        await eng._on_position_closed([], exit_price=0)
+                                        await notifier.send(
+                                            f"🚨 *{sym} RED BUTTON CLOSE*\n"
+                                            f"No data for {age:.0f}s — position closed for safety"
+                                        )
+                                    except Exception as e:
+                                        logger.error(f"[{sym}] Red button close failed: {e}")
 
                     logger.warning(
                         f"⚠️ WebSocket dead (connected={ws.connected}, "

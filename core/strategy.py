@@ -414,7 +414,9 @@ class StrategyEngine:
         self._update_indicators(closed_candles)
 
         # 2. Sync position from exchange
-        await self._sync_position(closed_candles)
+        should_continue = await self._sync_position(closed_candles)
+        if not should_continue:
+            return  # orphan closed — skip signals this candle
 
         # 3. If in position → update exchange SL/TP on candle close
         if self.state.in_position:
@@ -458,8 +460,11 @@ class StrategyEngine:
                 s.bear_fvg_bar = s.bar_counter
 
     # ── position sync ────────────────────────────────────────
-    async def _sync_position(self, candles: List[dict]):
-        """Sync state.in_position with actual exchange position."""
+    async def _sync_position(self, candles: List[dict]) -> bool:
+        """Sync state.in_position with actual exchange position.
+        Returns True if tick() should continue to signal generation,
+        False if an orphan was found/closed (skip signals this candle).
+        """
         pos = self.trader.get_position(self.symbol)
 
         if pos is None and self.state.in_position:
@@ -472,6 +477,7 @@ class StrategyEngine:
             except Exception as e:
                 logger.error(f"[{self.symbol}] Failed to cancel orders after close: {e}")
             await self._on_position_closed(candles)
+            return True
 
         elif pos is not None and not self.state.in_position:
             # Position exists but state says flat — this is ALWAYS an orphan.
@@ -494,6 +500,10 @@ class StrategyEngine:
                 logger.info(f"✅ [{self.symbol}] Orphan position closed.")
             except Exception as e:
                 logger.error(f"❌ [{self.symbol}] Failed to close orphan: {e}")
+            # Skip signal generation this candle — position may still be settling
+            return False
+
+        return True
 
     async def _on_position_closed(self, candles: List[dict], exit_price: float = None):
         """Handle position closure — adjust risk, save trade."""
