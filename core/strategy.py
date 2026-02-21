@@ -197,8 +197,10 @@ class StrategyEngine:
         self._emergency_first_seen = 0.0  # Emergency backup timer
         self._last_sl_exchange_update = 0.0  # Throttle: last time we updated exchange SL
         self._sl_update_interval = 15  # Min seconds between exchange SL updates
+        self._sl_trailing_interval = 10  # Tighter interval when trailing is active
         self._last_exchange_sl = 0.0  # Last SL value sent to exchange (dedup)
         self._fill_cache: Dict[int, dict] = {}  # oid → fill data from UserFills WS
+        self._emergency_timeout = 30  # Seconds past exchange SL before emergency close
 
     # ── persistence ──────────────────────────────────────────
     def _load_state(self):
@@ -682,6 +684,22 @@ class StrategyEngine:
             f"strongB={strong_bull} strongS={strong_bear} body={candle_body:.4f} thr={strong_threshold:.4f}"
         )
 
+        # Log when any condition partially matches (helps diagnose HL/Bybit divergence)
+        partial_long = ob_long or fvg_long
+        partial_short = ob_short or fvg_short
+        if partial_long or partial_short:
+            side_label = "LONG" if partial_long else "SHORT"
+            src = ("OB" if (ob_long or ob_short) else "FVG")
+            strong_ok = strong_bull if partial_long else strong_bear
+            logger.info(
+                f"🔍 [{self.symbol}] bar={s.bar_counter} {side_label} {src} zone hit | "
+                f"C={c['c']:.2f} body={candle_body:.2f}/{strong_threshold:.2f} "
+                f"strong={'✅' if strong_ok else '❌'} | "
+                f"bullOB={s.bull_ob:.2f} bearOB={s.bear_ob:.2f} "
+                f"bullFVG=[{getattr(s, 'bull_fvg_bottom', 0):.2f}-{getattr(s, 'bull_fvg_top', 0):.2f}] "
+                f"bearFVG=[{getattr(s, 'bear_fvg_bottom', 0):.2f}-{getattr(s, 'bear_fvg_top', 0):.2f}]"
+            )
+
         long_cond = long_cond and strong_bull
         short_cond = short_cond and strong_bear
 
@@ -817,12 +835,17 @@ class StrategyEngine:
         if not self._warmup_done or not s.in_position or self._lock:
             return None
 
-        # ── Emergency backup: price past SL for >10 seconds ──
+        # ── Emergency backup: price past exchange SL for >30 seconds ──
         # Exchange SL trigger should fire almost instantly. If price stays
-        # past SL for 10s, something is wrong — force market close.
+        # past SL for 30s, something is wrong — force market close.
         # IMPORTANT: compare against _last_exchange_sl (what's actually on exchange),
         # not s.current_sl (internal trailing which may be ahead of exchange due to throttle).
+        #
+        # Grace period: skip emergency check for 5s after an exchange SL update,
+        # because the trigger order needs time to be processed by HL.
         exchange_sl = self._last_exchange_sl if self._last_exchange_sl > 0 else s.current_sl
+        sl_just_updated = (time.time() - self._last_sl_exchange_update) < 5
+
         if s.position_side == "long":
             sl_breached = price <= exchange_sl
             breach_amount = exchange_sl - price if sl_breached else 0
@@ -830,18 +853,18 @@ class StrategyEngine:
             sl_breached = price >= exchange_sl
             breach_amount = price - exchange_sl if sl_breached else 0
 
-        if sl_breached:
+        if sl_breached and not sl_just_updated:
             now = time.time()
             if self._emergency_first_seen == 0:
                 self._emergency_first_seen = now
                 logger.warning(
                     f"⚠️ [{self.symbol}] Price {price:.2f} past exchange SL {exchange_sl:.2f} "
-                    f"by {breach_amount:.2f} (internal SL={s.current_sl:.2f}) — exchange should close within 10s"
+                    f"by {breach_amount:.2f} (internal SL={s.current_sl:.2f}) — exchange should close within {self._emergency_timeout}s"
                 )
                 return None
 
             elapsed = now - self._emergency_first_seen
-            if elapsed >= 10:  # 10 seconds past SL = exchange failed
+            if elapsed >= self._emergency_timeout:
                 logger.error(
                     f"🆘 [{self.symbol}] EMERGENCY CLOSE: price={price:.2f} past exchange SL={exchange_sl:.2f} "
                     f"(internal={s.current_sl:.2f}) for {elapsed:.0f}s — exchange trigger failed!"
@@ -905,7 +928,9 @@ class StrategyEngine:
             #   2. Throttle expired (normal 15s cadence)
             #   3. Big jump (>= 50% of trail_offset) — don't let exchange lag behind
             big_jump = abs(s.current_sl - self._last_exchange_sl) >= (s.sl_distance * STRATEGY.TRAIL_OFFSET_RATIO * 0.5) if self._last_exchange_sl > 0 else True
-            if now - self._last_sl_exchange_update >= self._sl_update_interval or big_jump:
+            # Use tighter update interval when trailing is active
+            interval = self._sl_trailing_interval if s.trailing_active else self._sl_update_interval
+            if now - self._last_sl_exchange_update >= interval or big_jump:
                 self._last_sl_exchange_update = now
                 return self._update_exchange_sl()
 
