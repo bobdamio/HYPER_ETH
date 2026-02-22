@@ -9,6 +9,7 @@
   - [4.1 AllMids → Price Ticks](#41-allmids--price-ticks)
   - [4.2 Candle WS → Strategy Tick](#42-candle-ws--strategy-tick)
   - [4.3 OrderUpdates → Position Close](#43-orderupdates--position-close)
+  - [4.4 UserFills → Fill Price Cache](#44-userfills--fill-price-cache)
 - [5. REST Fallback & Emergency Modes](#5-rest-fallback--emergency-modes)
 - [6. Strategy Engine Lifecycle](#6-strategy-engine-lifecycle)
   - [6.1 Warmup](#61-warmup)
@@ -44,7 +45,8 @@
         ▼         │                │
    ┌─────────────────────────────────┐
    │   HyperLiquid Exchange (L1)    │
-   │   WS: AllMids, Candle, Orders  │
+   │   WS: AllMids, Candle, Orders, │
+   │       UserFills                │
    │   REST: candles, user_state,   │
    │         orders, market_close   │
    └─────────────────────────────────┘
@@ -58,10 +60,10 @@
 
 | File | Lines | Responsibility |
 |------|-------|----------------|
-| `run.py` | ~409 | Entry point. Startup, main loop, WS health, REST fallback, emergency modes |
-| `core/strategy.py` | ~1081 | **Core logic.** Warmup, indicators, entries, exits, trailing SL, emergency close |
-| `core/trader.py` | ~424 | REST API: orders, positions, candles. Cached `user_state` (5s TTL) |
-| `core/ws_manager.py` | ~253 | WS subscriptions: AllMids, OrderUpdates, Candle. Candle buffer management |
+| `run.py` | ~451 | Entry point. Startup, main loop, WS health, REST fallback, emergency modes |
+| `core/strategy.py` | ~1255 | **Core logic.** Warmup, indicators, entries, exits, trailing SL, emergency close, fill price cache |
+| `core/trader.py` | ~423 | REST API: orders, positions, candles. Cached `user_state` (5s TTL) |
+| `core/ws_manager.py` | ~303 | WS subscriptions: AllMids, OrderUpdates, Candle, UserFills. Candle buffer management |
 | `core/notifier.py` | ~37 | Telegram notifications via aiohttp |
 | `core/signer.py` | ~57 | Wallet signing, Exchange + Info init, Unified Account equity |
 | `config/settings.py` | ~58 | Strategy params (mirrors Pine Script inputs), risk params, global config |
@@ -79,8 +81,8 @@ run.py::main()
 ├─ 1. Create HLTrader, Notifier
 ├─ 2. Create StrategyEngine per symbol (loads state_ETH.json)
 ├─ 3. Create HLWebSocketManager(loop)
-│     ├─ Register callbacks: on_price, on_order, on_candle_close
-│     └─ ws.start() → subscribes AllMids + OrderUpdates + Candle
+│     ├─ Register callbacks: on_price, on_order, on_candle_close, on_fill
+│     └─ ws.start() → subscribes AllMids + OrderUpdates + Candle + UserFills
 │
 ├─ 4. Log equity, prices, positions
 ├─ 5. Send Telegram startup notification
@@ -206,12 +208,55 @@ HyperLiquid WS                    ws_manager.py                    strategy.py
      │                                  │              if status='filled'
      │                                  │              AND 'Stop'|'Take Profit':
      │                                  │                               │
+     │                                  │              _get_fill_price(oid)
+     │                                  │                ├─ check _fill_cache (WS)
+     │                                  │                ├─ retry 300ms
+     │                                  │                ├─ REST user_fills_by_time
+     │                                  │                └─ fallback: mid-market
+     │                                  │                               │
      │                                  │              cancel_all_orders()
      │                                  │              verify_no_reverse()
      │                                  │              _on_position_closed()
 ```
 
 **Purpose:** Instant detection when exchange SL/TP fires. Faster than waiting for next candle close `_sync_position()`.
+
+**Fill price resolution:** The WS `OrderUpdates` payload contains `limitPx` — but for trigger orders (Stop Market, Take Profit), this is the far-limit guarantee price (±10% from trigger), NOT the actual fill price. Real fill price comes from the `UserFills` WS channel (see 4.4) or REST `user_fills_by_time` fallback.
+
+### 4.4 UserFills → Fill Price Cache
+
+```
+HyperLiquid WS                    ws_manager.py                    strategy.py
+     │                                  │                               │
+     │ {'fills': [{                     │                               │
+     │    coin: 'ETH',                  │                               │
+     │    oid: 12345,                   │                               │
+     │    px: '1980.5',                 │                               │
+     │    sz: '0.03',                   │                               │
+     │    side: 'B',                    │                               │
+     │    time: 1771549000              │                               │
+     │  }]}                             │                               │
+     ├─────────────────────────────────►│                               │
+     │                          _on_user_fills()                        │
+     │                          skip isSnapshot msgs                    │
+     │                                  │                               │
+     │                           for cb in _on_fill_cbs:                │
+     │                                  │  cb(fill_data)                │
+     │                                  ├──────────────────────────────►│
+     │                                  │                on_user_fill(fill)
+     │                                  │                  _fill_cache[oid] = fill
+     │                                  │                               │
+```
+
+**Purpose:** Capture real fill prices for SL/TP triggers. When `on_order_triggered()` fires, `_get_fill_price(oid)` checks `_fill_cache` first (instant, no REST call needed). The cache is populated by UserFills WS which typically arrives before or within milliseconds of the OrderUpdates event.
+
+**Fill price resolution chain (`_get_fill_price(oid)`):**
+1. **WS cache** — check `_fill_cache[oid]` (instant)
+2. **Wait 300ms + retry** — UserFills WS may arrive slightly after OrderUpdates
+3. **REST fallback** — `trader.user_fills_by_time(start, end)` for last 60s
+4. **Mid-market fallback** — use current price if all else fails (logged as warning)
+
+**Routing:** `run.py::make_fill_handler(engines)` dispatches fills by coin to the correct `StrategyEngine.on_user_fill()`.
 
 ---
 
@@ -312,9 +357,11 @@ tick(candles)
 on_price_update(price)
 │
 ├─ 1. EMERGENCY CHECK: price past SL?
+│     ├─ Skip if within 5s grace after exchange SL update
+│     ├─ Skip if price hasn't breached _last_exchange_sl
 │     ├─ YES, first time → start timer, log warning
-│     ├─ YES, ≥10s → EMERGENCY CLOSE (return _close_and_handle coroutine)
-│     ├─ YES, <10s → wait (return None)
+│     ├─ YES, ≥30s → EMERGENCY CLOSE (return _close_and_handle coroutine)
+│     ├─ YES, <30s → wait (return None)
 │     └─ NO → reset timer
 │
 ├─ 2. BREAKEVEN CHECK:
@@ -329,7 +376,7 @@ on_price_update(price)
 │
 └─ 4. IF SL changed:
       ├─ _save_state()
-      └─ Throttled (15s min): return _update_exchange_sl() coroutine
+      └─ Throttled (15s normal / 10s when trailing): return _update_exchange_sl() coroutine
 ```
 
 **Return values:**
@@ -383,15 +430,17 @@ FINAL:
   Short = (OB_short OR FVG_short) AND Strong_bear
 ```
 
+**Partial-match logging:** When an OB/FVG zone is hit but the strong candle filter fails, the bot logs the near-miss at INFO level (e.g. `"OB zone hit but candle not strong enough"`). This aids in diagnosing signal divergence between the bot (HL candle data) and Pine Script (Bybit/TradingView candle data).
+
 ### 6.5 Position Exit Paths
 
 There are **5 distinct ways** a position can close:
 
 | # | Path | Trigger | Speed | Code Location |
 |---|------|---------|-------|---------------|
-| 1 | **Exchange SL/TP** | HL exchange trigger fires | ~instant | Detected by `OrderUpdates` WS → `on_order_triggered()` |
+| 1 | **Exchange SL/TP** | HL exchange trigger fires | ~instant | Detected by `OrderUpdates` WS → `on_order_triggered()` → `_get_fill_price()` |
 | 2 | **Candle sync** | `_sync_position()` sees no position | ~15min max | `tick()` → `_sync_position()` |
-| 3 | **Emergency close** | Price past SL for >10s | 10s delay | `on_price_update()` → `_close_and_handle()` |
+| 3 | **Emergency close** | Price past SL for >30s | 30s delay | `on_price_update()` → `_close_and_handle()` |
 | 4 | **Red Button** | 60s price silence + position | 60s | `run.py` main loop |
 | 5 | **Orphan close** | State=FLAT but exchange has position | On tick | `_sync_position()` or warmup |
 
@@ -439,6 +488,13 @@ Exchange position?  │  State says in_position?  │  Action
 
 **Where:** `strategy.py::_close_and_handle()` L948
 
+**Trigger conditions (in `on_price_update`):**
+- Price has breached the **exchange SL** (`_last_exchange_sl`), not just the internal SL
+- At least **30 seconds** have passed since price first crossed the SL
+- NOT within **5-second grace period** after an exchange SL update (allows HL time to process the new trigger)
+
+**Why the grace period?** When trailing SL moves, the bot cancels old SL and places new one. During this 1-2s window, the old SL level is invalid but the new one may not be active yet. The 5s grace prevents false emergency triggers during this normal operation.
+
 ```
 _close_and_handle(exit_price)
 │
@@ -481,14 +537,15 @@ on_price_update() detects SL moved
       → _place_trigger(tp, "tp")        ← re-place same TP
 ```
 
-**Throttled:** Minimum 15s between exchange SL updates. `_last_exchange_sl` deduplicates same-value updates.
+**Throttled:** Minimum 15s between exchange SL updates (10s when trailing active). `_last_exchange_sl` deduplicates same-value updates.
 
 ### Exit (by exchange)
 ```
 Exchange fills SL/TP trigger
   → OrderUpdates WS fires
   → on_order_triggered()
-    → cancel_all_orders()    ← remove remaining trigger
+    → _get_fill_price(oid)    ← real price from UserFills WS cache / REST
+    → cancel_all_orders()     ← remove remaining trigger
     → verify_no_reverse()
     → _on_position_closed()
 ```
@@ -628,7 +685,11 @@ Short: price ≤ entry - trail_activation → SL = price + trail_offset
 │    → callbacks             │    │    → _check_entries()           │
 │                            │    │    → open_position()            │
 │  _on_order_update() ───────┼──► │  on_order_triggered() → async  │
-│    → callbacks             │    │    → _close_and_handle()        │
+│    → callbacks             │    │    → _get_fill_price()         │
+│                            │    │    → _close_and_handle()        │
+│  _on_user_fills() ─────────┼──► │                                 │
+│    → callbacks             │    │  on_user_fill() → sync          │
+│    → fill cache update     │    │    → _fill_cache[oid] = fill    │
 │                            │    │                                 │
 └────────────────────────────┘    │  main loop (run.py):            │
                                   │    → REST fallback              │
@@ -667,8 +728,10 @@ Short: price ≤ entry - trail_activation → SL = price + trail_offset
 | `WS_STALE_THRESHOLD` | `45s` | run.py | WS considered dead after |
 | `EMERGENCY_REST_INTERVAL` | `3s` | run.py | REST polling when WS dead |
 | `SILENCE_CLOSE_THRESHOLD` | `60s` | run.py | Red button: close all |
-| Emergency SL timer | `10s` | strategy.py | Force close if price past SL |
-| SL update throttle | `15s` | strategy.py | Min interval between exchange SL updates |
+| Emergency SL timer | `30s` | strategy.py | Force close if price past exchange SL |
+| Emergency SL grace | `5s` | strategy.py | Skip emergency check after SL update |
+| SL update throttle | `15s` / `10s` | strategy.py | Min interval between exchange SL updates (10s when trailing) |
+| Fill cache | `dict` | strategy.py | WS UserFills cached by oid for instant fill price lookup |
 | user_state cache TTL | `5s` | trader.py | REST cache for positions/equity |
 | meta cache TTL | `300s` | trader.py | REST cache for asset metadata |
 | WS backoff | `2-30s` | run.py | Exponential reconnect backoff |
@@ -684,9 +747,10 @@ run.py::main()
   │     └─ _load_state()
   │
   ├─ ws.start()
-  │     ├─ subscribe(AllMids)      → _on_all_mids       → on_price_update()
-  │     ├─ subscribe(OrderUpdates) → _on_order_update    → on_order_triggered()
-  │     └─ subscribe(Candle)       → _on_candle_msg      → tick()
+  │     ├─ subscribe(AllMids)       → _on_all_mids       → on_price_update()
+  │     ├─ subscribe(OrderUpdates)  → _on_order_update    → on_order_triggered()
+  │     ├─ subscribe(Candle)        → _on_candle_msg      → tick()
+  │     └─ subscribe(UserFills)     → _on_user_fills      → on_user_fill()
   │
   ├─ warmup(candles)
   │     ├─ _update OB/FVG from history
@@ -707,13 +771,18 @@ tick(candles)
               └─ trader.open_position()
 
 on_price_update(price)
-  ├─ emergency check → _close_and_handle()
+  ├─ emergency check (30s, 5s grace) → _close_and_handle()
   ├─ breakeven logic
   ├─ trailing SL logic
   └─ _update_exchange_sl()
         └─ trader.replace_sl_tp()
 
 on_order_triggered(data)
+  ├─ _get_fill_price(oid)
+  │     ├─ _fill_cache[oid]           ← from UserFills WS
+  │     ├─ retry 300ms
+  │     ├─ REST user_fills_by_time    ← fallback
+  │     └─ mid-market price           ← last resort
   ├─ cancel_all_orders()
   ├─ _verify_no_reverse_position()
   └─ _on_position_closed()
@@ -721,6 +790,9 @@ on_order_triggered(data)
         ├─ _save_trade()
         ├─ Telegram notification
         └─ _save_state()
+
+on_user_fill(fill_data)
+  └─ _fill_cache[oid] = fill          ← pre-cache for on_order_triggered
   
 _close_and_handle(exit_price)
   ├─ exchange.market_close()
