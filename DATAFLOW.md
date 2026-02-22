@@ -50,7 +50,7 @@
    └─────────────────────────────────┘
 ```
 
-**Основной принцип:** WebSocket — primary, REST — fallback. Биржа выполняет SL/TP ордера, бот только мониторит и обновляет их.
+**Basic principle:** WebSocket is primary, REST is fallback. The exchange executes SL/TP orders, the bot only monitors and updates them.
 
 ---
 
