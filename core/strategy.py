@@ -196,9 +196,8 @@ class StrategyEngine:
         self._lock = False  # Simple reentrance guard for async operations
         self._emergency_first_seen = 0.0  # Emergency backup timer
         self._last_sl_exchange_update = 0.0  # Throttle: last time we updated exchange SL
-        self._sl_update_interval = 15  # Min seconds between exchange SL updates
-        self._sl_trailing_interval = 10  # Tighter interval when trailing is active
-        self._last_exchange_sl = 0.0  # Last SL value sent to exchange (dedup)
+        self._sl_update_interval = 15  # Min seconds between exchange SL updates (breakeven only; trailing is on candle close)
+        self._last_exchange_sl = 0.0  # Last SL value sent to exchange (dedup + race prevention)
         self._fill_cache: Dict[int, dict] = {}  # oid → fill data from UserFills WS
         self._emergency_timeout = 30  # Seconds past exchange SL before emergency close
 
@@ -823,9 +822,13 @@ class StrategyEngine:
         Called from WebSocket on every mid-price tick (real-time).
         
         Responsibilities:
-        - Compute trailing SL / breakeven (update internal state)
-        - Emergency backup: if price is past SL for >10s, force market-close
+        - Compute breakeven SL (one-time flag, fast reaction OK)
+        - Emergency backup: if price is past SL for >30s, force market-close
           (exchange trigger order is primary; this is a safety net)
+        
+        Trailing SL is NOT computed here — it runs on candle close only
+        (in _manage_position_on_candle), matching Pine Script's strategy.exit()
+        which evaluates trail_price/trail_offset once per bar.
         
         We do NOT market-close on normal SL/TP hit — the exchange trigger order
         handles that. This avoids race conditions where both fire simultaneously
@@ -882,7 +885,7 @@ class StrategyEngine:
                 )
             self._emergency_first_seen = 0
 
-        # ── Compute breakeven & trailing (internal state only) ──
+        # ── Compute breakeven only (trailing is on candle close) ──
         old_sl = s.current_sl
 
         if s.position_side == "long":
@@ -894,14 +897,6 @@ class StrategyEngine:
                     s.breakeven_applied = True
                     logger.info(f"🔒 [{self.symbol}] Breakeven: SL → {s.current_sl:.2f}")
 
-            trail_activation = s.sl_distance * STRATEGY.RR_RATIO * STRATEGY.TRAIL_ACTIVATION_RATIO
-            trail_offset = s.sl_distance * STRATEGY.TRAIL_OFFSET_RATIO
-            if price >= s.entry_price + trail_activation:
-                trailing_sl = price - trail_offset
-                if trailing_sl > s.current_sl:
-                    s.current_sl = trailing_sl
-                    s.trailing_active = True
-
         else:  # short
             if not s.breakeven_applied and price <= s.entry_price - s.sl_distance:
                 buffer = s.sl_distance * 0.02
@@ -911,27 +906,15 @@ class StrategyEngine:
                     s.breakeven_applied = True
                     logger.info(f"🔒 [{self.symbol}] Breakeven: SL → {s.current_sl:.2f}")
 
-            trail_activation = s.sl_distance * STRATEGY.RR_RATIO * STRATEGY.TRAIL_ACTIVATION_RATIO
-            trail_offset = s.sl_distance * STRATEGY.TRAIL_OFFSET_RATIO
-            if price <= s.entry_price - trail_activation:
-                trailing_sl = price + trail_offset
-                if trailing_sl < s.current_sl:
-                    s.current_sl = trailing_sl
-                    s.trailing_active = True
-
         if s.current_sl != old_sl:
             self._save_state()
-            # Schedule exchange SL update
+            # Breakeven changed — update exchange immediately
             now = time.time()
-            # Immediate update if:
-            #   1. First time (throttle = 0)
-            #   2. Throttle expired (normal 15s cadence)
-            #   3. Big jump (>= 50% of trail_offset) — don't let exchange lag behind
-            big_jump = abs(s.current_sl - self._last_exchange_sl) >= (s.sl_distance * STRATEGY.TRAIL_OFFSET_RATIO * 0.5) if self._last_exchange_sl > 0 else True
-            # Use tighter update interval when trailing is active
-            interval = self._sl_trailing_interval if s.trailing_active else self._sl_update_interval
-            if now - self._last_sl_exchange_update >= interval or big_jump:
+            if now - self._last_sl_exchange_update >= self._sl_update_interval:
                 self._last_sl_exchange_update = now
+                # Optimistic update to prevent race condition:
+                # set _last_exchange_sl NOW so next tick doesn't trigger duplicate
+                self._last_exchange_sl = s.current_sl
                 return self._update_exchange_sl()
 
         return None
@@ -1201,8 +1184,11 @@ class StrategyEngine:
 
     async def _manage_position_on_candle(self, candles: List[dict]):
         """
-        Called on new candle close. Updates exchange SL/TP if trailing moved.
-        Also does full position sync with exchange.
+        Called on new candle close. Computes trailing SL and updates exchange.
+        
+        Trailing SL is evaluated HERE (candle close only), matching Pine Script's
+        strategy.exit() which processes trail_price/trail_offset once per bar.
+        This prevents tick-by-tick trailing from setting overly tight stops.
         """
         s = self.state
         if not s.in_position:
@@ -1219,12 +1205,47 @@ class StrategyEngine:
             await self._on_position_closed(candles, exit_price=candles[-1]["c"])
             return
 
-        # Update exchange SL if it changed AND wasn't already synced by WS trailing
-        if s.current_sl != s.initial_sl and s.current_sl != self._last_exchange_sl:
+        # ── Trailing SL (candle close only — mirrors Pine strategy.exit()) ──
+        # Use the close price of the just-closed candle (candles[-1] is forming)
+        closed = candles[-1]  # last closed candle from tick()'s candles[:-1]
+        close_price = closed["c"]
+        old_sl = s.current_sl
+
+        if s.position_side == "long":
+            trail_activation = s.sl_distance * STRATEGY.RR_RATIO * STRATEGY.TRAIL_ACTIVATION_RATIO
+            trail_offset = s.sl_distance * STRATEGY.TRAIL_OFFSET_RATIO
+            if close_price >= s.entry_price + trail_activation:
+                trailing_sl = close_price - trail_offset
+                if trailing_sl > s.current_sl:
+                    s.current_sl = trailing_sl
+                    s.trailing_active = True
+                    logger.info(
+                        f"📈 [{self.symbol}] Trailing SL → {s.current_sl:.2f} "
+                        f"(close={close_price:.2f}, offset={trail_offset:.2f})"
+                    )
+        else:  # short
+            trail_activation = s.sl_distance * STRATEGY.RR_RATIO * STRATEGY.TRAIL_ACTIVATION_RATIO
+            trail_offset = s.sl_distance * STRATEGY.TRAIL_OFFSET_RATIO
+            if close_price <= s.entry_price - trail_activation:
+                trailing_sl = close_price + trail_offset
+                if trailing_sl < s.current_sl:
+                    s.current_sl = trailing_sl
+                    s.trailing_active = True
+                    logger.info(
+                        f"📉 [{self.symbol}] Trailing SL → {s.current_sl:.2f} "
+                        f"(close={close_price:.2f}, offset={trail_offset:.2f})"
+                    )
+
+        if s.current_sl != old_sl:
+            self._save_state()
+
+        # Update exchange SL if it changed AND wasn't already synced
+        if s.current_sl != self._last_exchange_sl and s.current_sl != s.initial_sl:
             arrow = '📈' if s.position_side == 'long' else '📉'
             logger.info(
                 f"{arrow} [{self.symbol}] Candle sync exchange SL → {s.current_sl:.2f}"
             )
+            self._last_exchange_sl = s.current_sl  # Optimistic: prevent race
             await self.trader.replace_sl_tp(
                 symbol=self.symbol,
                 size=s.entry_size,
@@ -1232,7 +1253,7 @@ class StrategyEngine:
                 sl_price=s.current_sl,
                 tp_price=s.take_profit,
             )
-            self._last_exchange_sl = s.current_sl
+            self._last_sl_exchange_update = time.time()
 
     # ── trade log ────────────────────────────────────────────
     def _save_trade(self, trade: dict):

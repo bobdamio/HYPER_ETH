@@ -1,7 +1,7 @@
 # HYPER_ETH
 
 Automated trading bot for **ETH perpetual futures** on [HyperLiquid](https://hyperliquid.xyz/).  
-Exact translation of the ETH Trading strategy into a production system with real-time WebSocket execution.
+Exact translation of the Trading strategy into a production system with real-time WebSocket execution.
 
 ## Strategy
 
