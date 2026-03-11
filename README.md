@@ -1,6 +1,6 @@
 # HYPER_ETH
 
-Automated trading bot for **ETH perpetual futures** on [HyperLiquid](https://hyperliquid.xyz/).  
+Automated trading bot for **ETH perpetual futures** on [HyperLiquid](https://app.hyperliquid.xyz/join/MIXETH).  
 Exact translation of the Trading strategy into a production system with real-time WebSocket execution.
 
 ## Strategy
