@@ -745,9 +745,9 @@ class StrategyEngine:
         risk_dollars = (equity * s.current_risk) / 100
         size_coin = risk_dollars / sl_distance
 
-        # Clamp size
+        # Clamp size (leverage allows larger notional for same margin)
         min_size = 0.001
-        max_size = (equity * RISK.MAX_EQUITY_USAGE) / entry_price
+        max_size = (equity * RISK.MAX_EQUITY_USAGE * STRATEGY.LEVERAGE) / entry_price
         size_coin = max(min_size, min(size_coin, max_size))
 
         # Check minimum notional ($11)
@@ -790,10 +790,38 @@ class StrategyEngine:
             logger.error("Failed to open position.")
             return
 
+        # Recalculate SL/TP from ACTUAL fill price (not candle close).
+        # Pine uses strategy.position_avg_price — we must mirror that.
+        # In backtesting process_orders_on_close=true → fill = close, no difference.
+        # In live trading, slippage means fill ≠ close → must adjust SL/TP.
+        actual_entry = result["entry_price"]
+        if abs(actual_entry - entry_price) > 0.01:
+            logger.info(
+                f"🔧 [{self.symbol}] Adjusting SL/TP from fill price: "
+                f"close={entry_price:.2f} → fill={actual_entry:.2f} (Δ={actual_entry - entry_price:+.2f})"
+            )
+            if side == "long":
+                sl_price = actual_entry - sl_distance
+                tp_price = actual_entry + sl_distance * STRATEGY.RR_RATIO
+            else:
+                sl_price = actual_entry + sl_distance
+                tp_price = actual_entry - sl_distance * STRATEGY.RR_RATIO
+            # Update exchange SL/TP to corrected values
+            await self.trader.replace_sl_tp(
+                symbol=self.symbol,
+                size=result["size"],
+                side=side,
+                sl_price=sl_price,
+                tp_price=tp_price,
+            )
+            logger.info(
+                f"🔧 [{self.symbol}] SL/TP adjusted: SL={sl_price:.2f} TP={tp_price:.2f}"
+            )
+
         # Update state
         s.in_position = True
         s.position_side = side
-        s.entry_price = result["entry_price"]
+        s.entry_price = actual_entry
         s.entry_size = result["size"]
         s.entry_source = entry_source
         s.zone_level = zone_level
@@ -885,38 +913,9 @@ class StrategyEngine:
                 )
             self._emergency_first_seen = 0
 
-        # ── Compute breakeven only (trailing is on candle close) ──
-        old_sl = s.current_sl
-
-        if s.position_side == "long":
-            if not s.breakeven_applied and price >= s.entry_price + s.sl_distance:
-                buffer = s.sl_distance * 0.02
-                new_sl = max(s.initial_sl, s.zone_level - buffer)
-                if new_sl > s.current_sl:
-                    s.current_sl = new_sl
-                    s.breakeven_applied = True
-                    logger.info(f"🔒 [{self.symbol}] Breakeven: SL → {s.current_sl:.2f}")
-
-        else:  # short
-            if not s.breakeven_applied and price <= s.entry_price - s.sl_distance:
-                buffer = s.sl_distance * 0.02
-                new_sl = min(s.initial_sl, s.zone_level + buffer)
-                if new_sl < s.current_sl:
-                    s.current_sl = new_sl
-                    s.breakeven_applied = True
-                    logger.info(f"🔒 [{self.symbol}] Breakeven: SL → {s.current_sl:.2f}")
-
-        if s.current_sl != old_sl:
-            self._save_state()
-            # Breakeven changed — update exchange immediately
-            now = time.time()
-            if now - self._last_sl_exchange_update >= self._sl_update_interval:
-                self._last_sl_exchange_update = now
-                # Optimistic update to prevent race condition:
-                # set _last_exchange_sl NOW so next tick doesn't trigger duplicate
-                self._last_exchange_sl = s.current_sl
-                return self._update_exchange_sl()
-
+        # Breakeven and trailing are evaluated on candle close only
+        # (in _manage_position_on_candle), matching Pine Script behavior.
+        # on_price_update only handles emergency SL backup.
         return None
 
     async def _update_exchange_sl(self):
@@ -1205,12 +1204,32 @@ class StrategyEngine:
             await self._on_position_closed(candles, exit_price=candles[-1]["c"])
             return
 
-        # ── Trailing SL (candle close only — mirrors Pine strategy.exit()) ──
-        # Use the close price of the just-closed candle (candles[-1] is forming)
+        # ── Breakeven + Trailing SL (candle close only — mirrors Pine) ──
+        # Pine evaluates strategy.exit() once per bar close. Both breakeven
+        # (reached1R check) and trailing use the candle CLOSE price.
         closed = candles[-1]  # last closed candle from tick()'s candles[:-1]
         close_price = closed["c"]
         old_sl = s.current_sl
 
+        # Breakeven: Pine checks `close >= entry + slDistance` on bar close
+        if s.position_side == "long":
+            if not s.breakeven_applied and close_price >= s.entry_price + s.sl_distance:
+                buffer = s.sl_distance * 0.02
+                new_sl = max(s.initial_sl, s.zone_level - buffer)
+                if new_sl > s.current_sl:
+                    s.current_sl = new_sl
+                    s.breakeven_applied = True
+                    logger.info(f"🔒 [{self.symbol}] Breakeven (candle close): SL → {s.current_sl:.2f}")
+        else:  # short
+            if not s.breakeven_applied and close_price <= s.entry_price - s.sl_distance:
+                buffer = s.sl_distance * 0.02
+                new_sl = min(s.initial_sl, s.zone_level + buffer)
+                if new_sl < s.current_sl:
+                    s.current_sl = new_sl
+                    s.breakeven_applied = True
+                    logger.info(f"🔒 [{self.symbol}] Breakeven (candle close): SL → {s.current_sl:.2f}")
+
+        # Trailing SL
         if s.position_side == "long":
             trail_activation = s.sl_distance * STRATEGY.RR_RATIO * STRATEGY.TRAIL_ACTIVATION_RATIO
             trail_offset = s.sl_distance * STRATEGY.TRAIL_OFFSET_RATIO

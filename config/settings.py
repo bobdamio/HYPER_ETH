@@ -10,7 +10,7 @@ class STRATEGY:
 
     SYMBOLS = ["ETH"]  # Only ETH — other coins unprofitable
     TIMEFRAME = "15m"           # 15-minute candles
-    LEVERAGE = 5
+    LEVERAGE = 10
 
     # Pivot-based Order Blocks
     PIVOT_LENGTH = 6            # pivotLen = 6
@@ -45,7 +45,7 @@ class RISK:
 
     # Hard limits
     MIN_POSITION_USD = 11.0     # HyperLiquid minimum notional
-    MAX_POSITION_USD = 100.0    # Max single position
+    MAX_POSITION_USD = 600.0    # Max single position
     MAX_EQUITY_USAGE = 0.95     # maxSize = equity * 0.95
 
 

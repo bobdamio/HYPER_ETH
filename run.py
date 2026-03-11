@@ -226,7 +226,7 @@ async def main():
     ws_backoff = 2                 # exponential backoff: starts at 2s
     WS_BACKOFF_MAX = 30            # max backoff cap
     EMERGENCY_REST_INTERVAL = 3    # aggressive REST polling when WS dead (seconds)
-    SILENCE_CLOSE_THRESHOLD = 60   # close all positions if zero updates for this long
+    SILENCE_CLOSE_THRESHOLD = 300  # close all positions if zero updates for 5 min (SL/TP on exchange protect meanwhile)
     ws_emergency_mode = False      # True when WS is dead → aggressive REST polling
     ws_recovery_pongs = 0          # count successful WS pongs after recovery
 
