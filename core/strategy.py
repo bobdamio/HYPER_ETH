@@ -901,7 +901,8 @@ class StrategyEngine:
         # Set initial pending exit levels (active from next candle close)
         # Pine: strategy.exit() is called on the same bar as entry,
         # so these levels are checked against the next bar's OHLC.
-        trail_offset_price = sl_distance * STRATEGY.TRAIL_OFFSET_RATIO  # 20% of SL distance in $
+        trail_offset_ticks = sl_distance * STRATEGY.TRAIL_OFFSET_RATIO  # Pine: trailOffset = slDistance * 0.2 (ticks)
+        trail_offset_price = trail_offset_ticks * 0.01  # Convert ticks to price: ticks × syminfo.mintick
         s.pending_sl = sl_price
         s.pending_tp = tp_price
         if side == "long":
@@ -1366,7 +1367,8 @@ class StrategyEngine:
         trail_activation_price = entry_price + sl_distance * STRATEGY.RR_RATIO * STRATEGY.TRAIL_ACTIVATION_RATIO \
             if s.position_side == "long" else \
             entry_price - sl_distance * STRATEGY.RR_RATIO * STRATEGY.TRAIL_ACTIVATION_RATIO
-        trail_offset_price = sl_distance * STRATEGY.TRAIL_OFFSET_RATIO  # 20% of SL distance in $
+        trail_offset_ticks = sl_distance * STRATEGY.TRAIL_OFFSET_RATIO  # Pine: trailOffset = slDistance * 0.2 (ticks)
+        trail_offset_price = trail_offset_ticks * 0.01  # Convert ticks to price: ticks × syminfo.mintick
 
         # ── Store pending levels for next bar's real-time monitoring ──
         s.pending_sl = current_sl
