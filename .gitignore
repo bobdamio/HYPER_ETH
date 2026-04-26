@@ -1,6 +1,9 @@
 # Secrets
 .env
 
+# Local scripts
+check_hl_now.py
+
 # Python
 __pycache__/
 *.py[cod]
