@@ -428,8 +428,8 @@ class StrategyEngine:
         We use candles[-2] (last CLOSED candle) for signals/indicators.
 
         All exits are evaluated at candle close only (Pine: process_orders_on_close=true).
-        SL/TP checked intra-bar via on_price_update(). Trailing stop checked on
-        candle close only (in _manage_position_on_candle) to match Pine behavior.
+        SL/TP/trailing checked intra-bar via on_price_update().
+        Trailing levels recalculated on candle close in _manage_position_on_candle.
         """
         if len(candles) < STRATEGY.ATR_LENGTH + STRATEGY.PIVOT_LENGTH + 10:
             logger.warning(f"[{self.symbol}] Not enough candles ({len(candles)})")
@@ -931,9 +931,9 @@ class StrategyEngine:
         """
         Called from WebSocket on every mid-price tick (real-time).
 
-        Checks SL and TP intra-bar (Pine broker emulator does this too).
-        Trailing stop is checked on candle close only (in _manage_position_on_candle)
-        to match Pine's bar-close evaluation behavior.
+        Checks SL, TP, and trailing stop intra-bar.
+        Pine broker emulator evaluates all exit types against bar OHLC
+        intra-bar (process_orders_on_close only affects entries, not exits).
         """
         if not self._warmup_done or not self.state.in_position:
             return None
@@ -965,9 +965,9 @@ class StrategyEngine:
                 self._exit_was_intra_bar = True
                 return self._close_and_handle(s.pending_sl)
 
-        # Trailing stop: activation tracking only (no exit on ticks).
-        # Peak is updated tick-by-tick so we capture the true high/low,
-        # but the actual trail exit decision happens on candle close.
+        # Trailing stop: activation, peak tracking, AND exit — all intra-bar.
+        # Pine broker emulator evaluates trail_price/trail_offset against
+        # bar OHLC intra-bar, so exits happen within the bar, not at close.
         if s.pending_trail_activation > 0 and s.pending_trail_offset > 0:
             if is_long:
                 if price >= s.pending_trail_activation and not s.trailing_active:
@@ -989,6 +989,31 @@ class StrategyEngine:
                     )
                 elif s.trailing_active and price < s.trailing_peak:
                     s.trailing_peak = price
+
+            # Trail EXIT check (intra-bar, matching Pine broker emulator)
+            if s.trailing_active:
+                if is_long:
+                    trail_sl = s.trailing_peak - s.pending_trail_offset
+                    if price <= trail_sl:
+                        logger.info(
+                            f"📈 [{self.symbol}] TRAIL EXIT (intra-bar): "
+                            f"price={price:.2f} <= trail_sl={trail_sl:.2f} "
+                            f"(peak={s.trailing_peak:.2f})"
+                        )
+                        s.exit_reason = "trailing"
+                        self._exit_was_intra_bar = True
+                        return self._close_and_handle(price)
+                else:
+                    trail_sl = s.trailing_peak + s.pending_trail_offset
+                    if price >= trail_sl:
+                        logger.info(
+                            f"📉 [{self.symbol}] TRAIL EXIT (intra-bar): "
+                            f"price={price:.2f} >= trail_sl={trail_sl:.2f} "
+                            f"(peak={s.trailing_peak:.2f})"
+                        )
+                        s.exit_reason = "trailing"
+                        self._exit_was_intra_bar = True
+                        return self._close_and_handle(price)
 
         return None
 
@@ -1262,10 +1287,10 @@ class StrategyEngine:
             f"SL={s.pending_sl:.2f} TP={s.pending_tp:.2f} trail={'ON' if s.trailing_active else 'off'}"
         )
 
-        # ── Trailing stop check on candle close ──
-        # Pine broker emulator checks trail against bar OHLC, not ticks.
-        # We check against the closed bar's high/low for activation and
-        # close price for trail exit — matching Pine's bar-close semantics.
+        # ── Trailing stop fallback on candle close ──
+        # Primary trail exit is in on_price_update() (intra-bar).
+        # This is a safety net: update peak from bar OHLC and check exit
+        # in case WS ticks missed the exact high/low of the bar.
         if s.pending_trail_activation > 0 and s.pending_trail_offset > 0:
             is_long = s.position_side == "long"
 
