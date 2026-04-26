@@ -417,6 +417,10 @@ class StrategyEngine:
             f"bear_fvg=[{s.bear_fvg_bottom:.2f}-{s.bear_fvg_top:.2f}] (age={bear_age})"
         )
 
+        # Place exchange SL/TP safety net for existing position
+        if s.in_position and s.pending_sl > 0:
+            await self._update_exchange_sltp()
+
     async def tick(self, candles: List[dict]):
         """
         Called on each new closed candle (detected by run.py or polling fallback).
@@ -852,8 +856,7 @@ class StrategyEngine:
             f"Risk: `{s.current_risk:.1f}%`"
         )
 
-        # Execute — no exchange SL/TP.
-        # All exits evaluated at candle close only (process_orders_on_close=true).
+        # Execute — exchange SL/TP placed as safety net after fill.
         result = await self.trader.open_position(self.symbol, side, size_coin, 0, 0)
         if not result:
             logger.error("Failed to open position.")
@@ -918,6 +921,9 @@ class StrategyEngine:
 
         self._save_state()
         logger.info(f"✅ [{self.symbol}] Position opened: {side.upper()} @ {s.entry_price}")
+
+        # Place exchange SL/TP as safety net (bot checks internally, these are backup)
+        await self._update_exchange_sltp()
 
     # ── position management ──────────────────────────────────
 
@@ -1395,6 +1401,45 @@ class StrategyEngine:
             )
 
         self._save_state()
+
+        # Update exchange SL/TP safety net
+        await self._update_exchange_sltp()
+
+    # ── exchange SL/TP safety net ────────────────────────────
+    async def _update_exchange_sltp(self):
+        """Place/update SL and TP on exchange as a safety net.
+        
+        The bot handles exits internally (on_price_update for SL/TP,
+        _manage_position_on_candle for trailing). Exchange orders are
+        backup in case the bot crashes or loses WS connection.
+        
+        Dedup: skips update if SL hasn't changed since last placement.
+        """
+        s = self.state
+        if not s.in_position or s.pending_sl <= 0:
+            return
+
+        # Dedup: don't spam exchange if levels haven't changed
+        sl_to_place = round(s.pending_sl, 2)
+        tp_to_place = round(s.pending_tp, 2) if s.pending_tp > 0 else 0
+
+        if sl_to_place == self._last_exchange_sl:
+            return
+
+        try:
+            await self.trader.replace_sl_tp(
+                symbol=self.symbol,
+                size=s.entry_size,
+                side=s.position_side,
+                sl_price=sl_to_place,
+                tp_price=tp_to_place,
+            )
+            self._last_exchange_sl = sl_to_place
+            logger.info(
+                f"🔄 [{self.symbol}] Exchange SL/TP updated: SL={sl_to_place:.2f} TP={tp_to_place:.2f}"
+            )
+        except Exception as e:
+            logger.error(f"[{self.symbol}] Failed to update exchange SL/TP: {e}")
 
     # ── emergency SL helper ─────────────────────────────────
     def _calc_emergency_sl(self, side: str, base_sl: float, sl_distance: float) -> float:
