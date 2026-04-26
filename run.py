@@ -44,6 +44,28 @@ logging.getLogger("httpx").setLevel(logging.WARNING)
 logging.getLogger("urllib3").setLevel(logging.WARNING)
 logging.getLogger("httpcore").setLevel(logging.WARNING)
 
+# ── Watchdog Thread ──────────────────────────────────────────
+# If main loop hasn't ticked for 5 minutes, force-exit process.
+# Docker's restart=unless-stopped will bring it back.
+import threading
+
+_watchdog_last_tick = time.time()
+WATCHDOG_TIMEOUT = 300  # 5 minutes
+
+def watchdog_thread():
+    global _watchdog_last_tick
+    while True:
+        time.sleep(30)
+        elapsed = time.time() - _watchdog_last_tick
+        if elapsed > WATCHDOG_TIMEOUT:
+            logger.error(
+                f"🐕 WATCHDOG: main loop stuck for {elapsed:.0f}s — force-exiting!"
+            )
+            os._exit(1)  # hard exit — Docker will restart us
+
+threading.Thread(target=watchdog_thread, daemon=True, name="watchdog").start()
+
+
 # ── Globals ──────────────────────────────────────────────────
 RUNNING = True
 
@@ -232,7 +254,9 @@ async def main():
 
     while RUNNING:
         try:
+            global _watchdog_last_tick
             now = time.time()
+            _watchdog_last_tick = now  # pet the watchdog
 
             # ── Fallback: REST candle check ──
             # Normal mode: every 60s. Emergency mode (WS dead): every 3s
@@ -347,44 +371,8 @@ async def main():
                                 pass
                         logger.info("🔌 WebSocket reconnected + candle buffers re-seeded")
 
-                        # Post-reconnect SL sanity: verify SL orders actually exist on exchange
-                        for sym in symbols:
-                            eng = engines[sym]
-                            s = eng.state
-                            if s.in_position and s.current_sl > 0:
-                                try:
-                                    # Check actual orders on exchange
-                                    open_ords = trader.info.frontend_open_orders(
-                                        trader.signer.address
-                                    )
-                                    sym_sl_orders = [
-                                        o for o in open_ords
-                                        if o.get("coin") == sym
-                                        and "Stop" in o.get("orderType", "")
-                                    ]
-                                    if not sym_sl_orders:
-                                        logger.warning(
-                                            f"🚨 [{sym}] NO SL order on exchange! "
-                                            f"Re-placing SL={s.current_sl:.2f} + TP={s.take_profit:.2f}"
-                                        )
-                                        eng._last_exchange_sl = 0.0
-                                        await eng._update_exchange_sl()
-                                    else:
-                                        # Verify SL price matches
-                                        exch_sl = float(sym_sl_orders[0].get("triggerPx", 0))
-                                        if abs(exch_sl - s.current_sl) > 0.5:
-                                            logger.warning(
-                                                f"⚠️ [{sym}] Exchange SL={exch_sl:.2f} != "
-                                                f"bot SL={s.current_sl:.2f} — re-syncing"
-                                            )
-                                            eng._last_exchange_sl = 0.0
-                                            await eng._update_exchange_sl()
-                                        else:
-                                            logger.info(
-                                                f"🛡️ [{sym}] SL verified on exchange: {exch_sl:.2f}"
-                                            )
-                                except Exception as e:
-                                    logger.error(f"[{sym}] Post-reconnect SL check failed: {e}")
+                        # No exchange SL/TP — all exits at candle close only
+                        logger.info("🔌 No exchange SL/TP to verify (candle-close-only mode)")
 
                         ws_backoff = 2  # reset backoff on success
                     except Exception as e:

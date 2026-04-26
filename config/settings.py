@@ -9,7 +9,8 @@ class STRATEGY:
     """Core strategy parameters — mirrors Pine Script inputs."""
 
     SYMBOLS = ["ETH"]  # Only ETH — other coins unprofitable
-    TIMEFRAME = "15m"           # 15-minute candles
+    TIMEFRAME = "1h"            # 1-hour candles
+    BAR_INTERVAL_MS = 3600000      # 1h in milliseconds
     LEVERAGE = 10
 
     # Pivot-based Order Blocks

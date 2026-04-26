@@ -219,21 +219,24 @@ class HLTrader:
         # Wait briefly for exchange state to settle
         await asyncio.sleep(0.5)
 
-        # Place SL & TP trigger orders on exchange for protection
-        await self._place_trigger(
-            symbol=symbol,
-            is_buy=not is_buy,
-            size=filled_size,
-            trigger_px=round(sl_price, px_dec),
-            tpsl="sl",
-        )
-        await self._place_trigger(
-            symbol=symbol,
-            is_buy=not is_buy,
-            size=filled_size,
-            trigger_px=round(tp_price, px_dec),
-            tpsl="tp",
-        )
+        # Place SL trigger only if sl_price > 0 (candle-close mode skips exchange SL)
+        if sl_price > 0:
+            await self._place_trigger(
+                symbol=symbol,
+                is_buy=not is_buy,
+                size=filled_size,
+                trigger_px=round(sl_price, px_dec),
+                tpsl="sl",
+            )
+        # Place TP trigger only if tp_price > 0 (candle-close mode skips exchange TP)
+        if tp_price > 0:
+            await self._place_trigger(
+                symbol=symbol,
+                is_buy=not is_buy,
+                size=filled_size,
+                trigger_px=round(tp_price, px_dec),
+                tpsl="tp",
+            )
 
         return {
             "side": side.lower(),
@@ -374,8 +377,9 @@ class HLTrader:
 
     async def replace_sl_tp(self, symbol: str, size: float, side: str, sl_price: float, tp_price: float):
         """
-        Cancel all orders and re-place both SL and TP.
+        Cancel all orders and re-place SL (and optionally TP).
         side: position side ('long' or 'short').
+        tp_price: set to 0 to skip TP placement (candle-close evaluation mode).
         """
         await self.cancel_all_orders(symbol)
 
@@ -389,13 +393,14 @@ class HLTrader:
             trigger_px=round(sl_price, px_dec),
             tpsl="sl",
         )
-        await self._place_trigger(
-            symbol=symbol,
-            is_buy=is_close_buy,
-            size=size,
-            trigger_px=round(tp_price, px_dec),
-            tpsl="tp",
-        )
+        if tp_price > 0:
+            await self._place_trigger(
+                symbol=symbol,
+                is_buy=is_close_buy,
+                size=size,
+                trigger_px=round(tp_price, px_dec),
+                tpsl="tp",
+            )
 
     # ── helpers ──────────────────────────────────────────────
     @staticmethod

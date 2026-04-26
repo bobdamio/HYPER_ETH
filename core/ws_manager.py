@@ -91,13 +91,22 @@ class HLWebSocketManager:
         self._connected = True
 
     def stop(self):
-        """Disconnect WebSocket."""
-        if self._info and self._info.ws_manager:
-            try:
-                self._info.disconnect_websocket()
-            except Exception:
-                pass
+        """Disconnect WebSocket with timeout to avoid hangs."""
         self._connected = False
+        if self._info and self._info.ws_manager:
+            import threading
+            def _disconnect():
+                try:
+                    self._info.disconnect_websocket()
+                except Exception:
+                    pass
+            t = threading.Thread(target=_disconnect, daemon=True)
+            t.start()
+            t.join(timeout=5)  # 5s max — if it hangs, we abandon it
+            if t.is_alive():
+                logger.warning("WS disconnect timed out after 5s — abandoning old connection")
+        # Always create fresh Info on next start() — never reuse stale _info
+        self._info = None
         logger.info("WebSocket disconnected")
 
     @property

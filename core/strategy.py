@@ -56,6 +56,9 @@ class TradeState:
     sl_distance: float = 0.0
     breakeven_applied: bool = False
     trailing_active: bool = False
+    trailing_sl: float = 0.0          # Internal trailing SL (NOT on exchange)
+    trailing_peak: float = 0.0        # Highest high (long) / lowest low (short) since trail activation
+    exit_reason: str = ""             # SL/TP/trailing/breakeven/emergency/sync
     entry_time: float = 0.0
 
     # Smooth dynamic risk
@@ -63,6 +66,7 @@ class TradeState:
 
     # Cooldown
     last_exit_bar: int = 0
+    last_exit_t: int = 0             # timestamp (ms) of last exit candle
 
     # Order Blocks (latest detected)
     bull_ob: float = 0.0
@@ -72,9 +76,11 @@ class TradeState:
     bull_fvg_top: float = 0.0
     bull_fvg_bottom: float = 0.0
     bull_fvg_bar: int = 0
+    bull_fvg_t: int = 0               # timestamp (ms) when bull FVG detected
     bear_fvg_top: float = 0.0
     bear_fvg_bottom: float = 0.0
     bear_fvg_bar: int = 0
+    bear_fvg_t: int = 0               # timestamp (ms) when bear FVG detected
 
     # Trade counter
     total_trades: int = 0
@@ -83,6 +89,14 @@ class TradeState:
 
     # Bar counter (persisted for FVG validity and cooldown)
     bar_counter: int = 0
+    last_bar_t: int = 0               # timestamp (ms) of last processed candle
+
+    # ── Pending exit levels (set at candle close, active during next bar) ──
+    # These mirror Pine's strategy.exit() standing orders.
+    pending_sl: float = 0.0
+    pending_tp: float = 0.0
+    pending_trail_activation: float = 0.0   # price level where trail activates
+    pending_trail_offset: float = 0.0       # trail offset in price $
 
 
 # ────────────────────────────────────────────────────────────
@@ -138,13 +152,13 @@ def detect_pivot_high(candles: List[dict], left: int, right: int) -> Optional[in
     pivot_idx = len(candles) - 1 - right  # the candidate bar
     pivot_high = candles[pivot_idx]["h"]
 
-    # Check left bars
+    # Check left bars (Pine: pivot must be STRICTLY higher than all neighbors)
     for i in range(1, left + 1):
-        if candles[pivot_idx - i]["h"] > pivot_high:
+        if candles[pivot_idx - i]["h"] >= pivot_high:
             return None
     # Check right bars
     for i in range(1, right + 1):
-        if candles[pivot_idx + i]["h"] > pivot_high:
+        if candles[pivot_idx + i]["h"] >= pivot_high:
             return None
 
     return pivot_idx
@@ -158,11 +172,12 @@ def detect_pivot_low(candles: List[dict], left: int, right: int) -> Optional[int
     pivot_idx = len(candles) - 1 - right
     pivot_low = candles[pivot_idx]["l"]
 
+    # Pine: pivot must be STRICTLY lower than all neighbors
     for i in range(1, left + 1):
-        if candles[pivot_idx - i]["l"] < pivot_low:
+        if candles[pivot_idx - i]["l"] <= pivot_low:
             return None
     for i in range(1, right + 1):
-        if candles[pivot_idx + i]["l"] < pivot_low:
+        if candles[pivot_idx + i]["l"] <= pivot_low:
             return None
 
     return pivot_idx
@@ -192,14 +207,22 @@ class StrategyEngine:
         self.STATE_FILE = os.path.join(GLOBAL.DATA_DIR, f"state_{symbol}.json")
         self._load_state()
         self._last_candle_t = 0
+        self._bar_ms = STRATEGY.BAR_INTERVAL_MS  # 1h = 3600000ms
         self._warmup_done = False  # Blocks all WS callbacks until warmup + sync complete
         self._lock = False  # Simple reentrance guard for async operations
         self._emergency_first_seen = 0.0  # Emergency backup timer
+        self._exit_was_intra_bar = False  # True when SL/TP fired between candle closes
         self._last_sl_exchange_update = 0.0  # Throttle: last time we updated exchange SL
         self._sl_update_interval = 15  # Min seconds between exchange SL updates (breakeven only; trailing is on candle close)
         self._last_exchange_sl = 0.0  # Last SL value sent to exchange (dedup + race prevention)
         self._fill_cache: Dict[int, dict] = {}  # oid → fill data from UserFills WS
         self._emergency_timeout = 30  # Seconds past exchange SL before emergency close
+
+    def _bars_between(self, t1: int, t2: int) -> int:
+        """Compute number of bars between two timestamps (ms)."""
+        if t1 <= 0 or t2 <= 0:
+            return 9999  # treat missing timestamps as very old
+        return abs(t2 - t1) // self._bar_ms
 
     # ── persistence ──────────────────────────────────────────
     def _load_state(self):
@@ -253,13 +276,13 @@ class StrategyEngine:
                 is_pivot_low = True
 
                 for j in range(1, plen + 1):
-                    if candles[candidate - j]["h"] > candles[candidate]["h"]:
+                    if candles[candidate - j]["h"] >= candles[candidate]["h"]:
                         is_pivot_high = False
-                    if candles[candidate + j]["h"] > candles[candidate]["h"]:
+                    if candles[candidate + j]["h"] >= candles[candidate]["h"]:
                         is_pivot_high = False
-                    if candles[candidate - j]["l"] < candles[candidate]["l"]:
+                    if candles[candidate - j]["l"] <= candles[candidate]["l"]:
                         is_pivot_low = False
-                    if candles[candidate + j]["l"] < candles[candidate]["l"]:
+                    if candles[candidate + j]["l"] <= candles[candidate]["l"]:
                         is_pivot_low = False
 
                 if is_pivot_high:
@@ -278,23 +301,29 @@ class StrategyEngine:
                     s.bull_fvg_top = c0["l"]
                     s.bull_fvg_bottom = c2["h"]
                     s.bull_fvg_bar = bar_num
+                    s.bull_fvg_t = candles[i]["t"]
                     fvg_count += 1
 
                 if c0["h"] < c2["l"]:  # Bearish FVG
                     s.bear_fvg_top = c2["l"]
                     s.bear_fvg_bottom = c0["h"]
                     s.bear_fvg_bar = bar_num
+                    s.bear_fvg_t = candles[i]["t"]
                     fvg_count += 1
 
         # Set bar_counter to match closed candle count (excluding forming candle)
         s.bar_counter = len(candles) - 1
         # Store last CLOSED candle timestamp (candles[-2], since candles[-1] is forming)
         # This ensures the first WS candle close is detected as a new candle
-        self._last_candle_t = candles[-2]["t"] if len(candles) >= 2 else candles[-1]["t"]
+        last_closed_t = candles[-2]["t"] if len(candles) >= 2 else candles[-1]["t"]
+        self._last_candle_t = last_closed_t
+        s.last_bar_t = last_closed_t
 
-        # Fix cooldown: last_exit_bar from previous session may be > new bar_counter
-        # which would block entries for hours until bar_counter catches up
-        if s.last_exit_bar >= s.bar_counter:
+        # Fix cooldown: use timestamps if available, fall back to bar_counter
+        if s.last_exit_t > 0:
+            # Timestamps survive restart — no reset needed
+            pass
+        elif s.last_exit_bar >= s.bar_counter:
             old_exit_bar = s.last_exit_bar
             s.last_exit_bar = max(0, s.bar_counter - 1)
             logger.info(
@@ -378,12 +407,14 @@ class StrategyEngine:
         # NOW safe to allow WS callbacks (on_price_update, etc.)
         self._warmup_done = True
 
+        bull_age = self._bars_between(s.bull_fvg_t, s.last_bar_t) if s.bull_fvg_t > 0 else (s.bar_counter - s.bull_fvg_bar)
+        bear_age = self._bars_between(s.bear_fvg_t, s.last_bar_t) if s.bear_fvg_t > 0 else (s.bar_counter - s.bear_fvg_bar)
         logger.info(
             f"[{self.symbol}] Warmup complete: {len(candles)} bars | "
             f"OBs detected: {ob_count} | FVGs detected: {fvg_count} | "
             f"bull_ob={s.bull_ob:.2f} | bear_ob={s.bear_ob:.2f} | "
-            f"bull_fvg=[{s.bull_fvg_bottom:.2f}-{s.bull_fvg_top:.2f}] (age={s.bar_counter - s.bull_fvg_bar}) | "
-            f"bear_fvg=[{s.bear_fvg_bottom:.2f}-{s.bear_fvg_top:.2f}] (age={s.bar_counter - s.bear_fvg_bar})"
+            f"bull_fvg=[{s.bull_fvg_bottom:.2f}-{s.bull_fvg_top:.2f}] (age={bull_age}) | "
+            f"bear_fvg=[{s.bear_fvg_bottom:.2f}-{s.bear_fvg_top:.2f}] (age={bear_age})"
         )
 
     async def tick(self, candles: List[dict]):
@@ -392,8 +423,9 @@ class StrategyEngine:
         HL API returns current unclosed candle as candles[-1].
         We use candles[-2] (last CLOSED candle) for signals/indicators.
 
-        Real-time exit management (trailing, SL/TP backup) is handled by
-        on_price_update() via WebSocket — NOT here.
+        All exits are evaluated at candle close only (Pine: process_orders_on_close=true).
+        SL/TP checked intra-bar via on_price_update(). Trailing stop checked on
+        candle close only (in _manage_position_on_candle) to match Pine behavior.
         """
         if len(candles) < STRATEGY.ATR_LENGTH + STRATEGY.PIVOT_LENGTH + 10:
             logger.warning(f"[{self.symbol}] Not enough candles ({len(candles)})")
@@ -408,6 +440,7 @@ class StrategyEngine:
 
         self._last_candle_t = closed_t
         self.state.bar_counter += 1
+        self.state.last_bar_t = closed_t
 
         # Use all candles up to and including last closed (exclude current unclosed)
         closed_candles = candles[:-1]
@@ -427,6 +460,9 @@ class StrategyEngine:
 
         # 4. If flat → check entry signals
         await self._check_entries(closed_candles)
+        # Entry fills at bar close. Exit orders placed by _enter_position() are
+        # pending — they get checked starting from the NEXT bar (bar N+1).
+        # No OHLC check on the entry bar: H and L happened BEFORE entry.
 
     # ── indicator update ─────────────────────────────────────
     def _update_indicators(self, candles: List[dict]):
@@ -454,12 +490,14 @@ class StrategyEngine:
                 s.bull_fvg_top = c0["l"]
                 s.bull_fvg_bottom = c2["h"]
                 s.bull_fvg_bar = s.bar_counter
+                s.bull_fvg_t = c0["t"]
 
             # Bearish FVG: high < low[2]
             if c0["h"] < c2["l"]:
                 s.bear_fvg_top = c2["l"]
                 s.bear_fvg_bottom = c0["h"]
                 s.bear_fvg_bar = s.bar_counter
+                s.bear_fvg_t = c0["t"]
 
     # ── position sync ────────────────────────────────────────
     async def _sync_position(self, candles: List[dict]) -> bool:
@@ -564,15 +602,19 @@ class StrategyEngine:
             "ema_deviation_pct": round(getattr(s, '_entry_ema_dev', 0), 3),
             "atr_pct": round(getattr(s, '_entry_atr_pct', 0), 3),
             "ema50_at_entry": round(getattr(s, '_entry_ema50', 0), 2),
+            "exit_reason": s.exit_reason or "exchange_sltp",
         })
 
         # Notify
+        exit_reason_str = s.exit_reason or "SL/TP"
+        balance = self.trader.get_equity()
         await self.notifier.send(
-            f"{result_emoji} *{self.symbol} Trade Closed*\n"
+            f"{result_emoji} *{self.symbol} Trade Closed ({exit_reason_str})*\n"
             f"Side: `{s.position_side.upper()}`\n"
             f"Source: `{s.entry_source}`\n"
             f"Entry: `{s.entry_price}` → Exit: `{last_price}`\n"
-            f"PnL: `{pnl_pct:+.2f}%`\n"
+            f"PnL: `{pnl_pct:+.2f}%` (`{pnl_usd:+.2f}$`)\n"
+            f"Balance: `{balance:.2f}$`\n"
             f"Risk now: `{s.current_risk:.1f}%` | "
             f"W/L: `{s.wins}/{s.losses}` ({s.total_trades} total)"
         )
@@ -595,8 +637,19 @@ class StrategyEngine:
         s.sl_distance = 0.0
         s.breakeven_applied = False
         s.trailing_active = False
+        s.trailing_sl = 0.0
+        s.trailing_peak = 0.0
+        s.exit_reason = ""
         s.entry_time = 0.0
+        # Clear pending exit levels
+        s.pending_sl = 0.0
+        s.pending_tp = 0.0
+        s.pending_trail_activation = 0.0
+        s.pending_trail_offset = 0.0
+        # Pine: lastExitBar := bar_index (= N, the bar where position closes).
+        # Use timestamp so cooldown survives restarts.
         s.last_exit_bar = s.bar_counter
+        s.last_exit_t = s.last_bar_t
         self._last_exchange_sl = 0.0  # Reset for next position
 
         self._save_state()
@@ -608,8 +661,12 @@ class StrategyEngine:
         s = self.state
         c = candles[-1]  # last CLOSED candle
 
-        # Cooldown check
-        if s.bar_counter <= s.last_exit_bar + STRATEGY.COOLDOWN_BARS:
+        # Cooldown check (use timestamps if available, fall back to bar_counter)
+        if s.last_exit_t > 0 and s.last_bar_t > 0:
+            bars_since_exit = self._bars_between(s.last_exit_t, s.last_bar_t)
+        else:
+            bars_since_exit = s.bar_counter - s.last_exit_bar
+        if bars_since_exit <= STRATEGY.COOLDOWN_BARS:
             return
 
         # ATR & EMA50
@@ -633,13 +690,24 @@ class StrategyEngine:
         fvg_short = False
 
         if STRATEGY.USE_FVG:
+            # Use timestamps for FVG age (survives restarts)
+            if s.bull_fvg_t > 0 and s.last_bar_t > 0:
+                bull_fvg_age = self._bars_between(s.bull_fvg_t, s.last_bar_t)
+            else:
+                bull_fvg_age = s.bar_counter - s.bull_fvg_bar
+
+            if s.bear_fvg_t > 0 and s.last_bar_t > 0:
+                bear_fvg_age = self._bars_between(s.bear_fvg_t, s.last_bar_t)
+            else:
+                bear_fvg_age = s.bar_counter - s.bear_fvg_bar
+
             bull_fvg_valid = (
                 s.bull_fvg_bottom > 0
-                and (s.bar_counter - s.bull_fvg_bar) <= STRATEGY.FVG_LOOKBACK
+                and bull_fvg_age <= STRATEGY.FVG_LOOKBACK
             )
             bear_fvg_valid = (
                 s.bear_fvg_top > 0
-                and (s.bar_counter - s.bear_fvg_bar) <= STRATEGY.FVG_LOOKBACK
+                and bear_fvg_age <= STRATEGY.FVG_LOOKBACK
             )
 
             # Pine: fvgLongCondition = bullFVG_valid and low <= bullFVG_top and close > bullFVG_bottom
@@ -745,9 +813,9 @@ class StrategyEngine:
         risk_dollars = (equity * s.current_risk) / 100
         size_coin = risk_dollars / sl_distance
 
-        # Clamp size (leverage allows larger notional for same margin)
+        # Clamp size: Pine — maxSize = (strategy.equity * 0.95) / close
         min_size = 0.001
-        max_size = (equity * RISK.MAX_EQUITY_USAGE * STRATEGY.LEVERAGE) / entry_price
+        max_size = (equity * RISK.MAX_EQUITY_USAGE) / entry_price
         size_coin = max(min_size, min(size_coin, max_size))
 
         # Check minimum notional ($11)
@@ -784,16 +852,15 @@ class StrategyEngine:
             f"Risk: `{s.current_risk:.1f}%`"
         )
 
-        # Execute
-        result = await self.trader.open_position(self.symbol, side, size_coin, sl_price, tp_price)
+        # Execute — no exchange SL/TP.
+        # All exits evaluated at candle close only (process_orders_on_close=true).
+        result = await self.trader.open_position(self.symbol, side, size_coin, 0, 0)
         if not result:
             logger.error("Failed to open position.")
             return
 
         # Recalculate SL/TP from ACTUAL fill price (not candle close).
         # Pine uses strategy.position_avg_price — we must mirror that.
-        # In backtesting process_orders_on_close=true → fill = close, no difference.
-        # In live trading, slippage means fill ≠ close → must adjust SL/TP.
         actual_entry = result["entry_price"]
         if abs(actual_entry - entry_price) > 0.01:
             logger.info(
@@ -806,16 +873,8 @@ class StrategyEngine:
             else:
                 sl_price = actual_entry + sl_distance
                 tp_price = actual_entry - sl_distance * STRATEGY.RR_RATIO
-            # Update exchange SL/TP to corrected values
-            await self.trader.replace_sl_tp(
-                symbol=self.symbol,
-                size=result["size"],
-                side=side,
-                sl_price=sl_price,
-                tp_price=tp_price,
-            )
             logger.info(
-                f"🔧 [{self.symbol}] SL/TP adjusted: SL={sl_price:.2f} TP={tp_price:.2f}"
+                f"🔧 [{self.symbol}] SL/TP recalculated from fill: SL={sl_price:.2f} TP={tp_price:.2f}"
             )
 
         # Update state
@@ -831,10 +890,26 @@ class StrategyEngine:
         s.take_profit = tp_price
         s.breakeven_applied = False
         s.trailing_active = False
+        s.trailing_sl = 0.0
+        s.trailing_peak = 0.0
+        s.exit_reason = ""
         s.entry_time = time.time()
-        self._last_exchange_sl = sl_price  # Exchange has initial SL from open_position
-        self._last_sl_exchange_update = 0.0  # Reset throttle for new position
-        self._emergency_first_seen = 0  # Reset emergency timer for new position
+        self._last_exchange_sl = 0.0
+        self._last_sl_exchange_update = 0.0
+        self._emergency_first_seen = 0
+
+        # Set initial pending exit levels (active from next candle close)
+        # Pine: strategy.exit() is called on the same bar as entry,
+        # so these levels are checked against the next bar's OHLC.
+        trail_offset_price = sl_distance * STRATEGY.TRAIL_OFFSET_RATIO  # 20% of SL distance in $
+        s.pending_sl = sl_price
+        s.pending_tp = tp_price
+        if side == "long":
+            s.pending_trail_activation = actual_entry + sl_distance * STRATEGY.RR_RATIO * STRATEGY.TRAIL_ACTIVATION_RATIO
+        else:
+            s.pending_trail_activation = actual_entry - sl_distance * STRATEGY.RR_RATIO * STRATEGY.TRAIL_ACTIVATION_RATIO
+        s.pending_trail_offset = trail_offset_price
+
         # Store entry analytics for data-driven tuning
         s._entry_ema_dev = ema_deviation_pct
         s._entry_atr_pct = atr_pct
@@ -843,109 +918,72 @@ class StrategyEngine:
         self._save_state()
         logger.info(f"✅ [{self.symbol}] Position opened: {side.upper()} @ {s.entry_price}")
 
-    # ── position management (hybrid: exchange SL/TP + WS real-time) ──
+    # ── position management ──────────────────────────────────
 
     def on_price_update(self, price: float):
         """
         Called from WebSocket on every mid-price tick (real-time).
-        
-        Responsibilities:
-        - Compute breakeven SL (one-time flag, fast reaction OK)
-        - Emergency backup: if price is past SL for >30s, force market-close
-          (exchange trigger order is primary; this is a safety net)
-        
-        Trailing SL is NOT computed here — it runs on candle close only
-        (in _manage_position_on_candle), matching Pine Script's strategy.exit()
-        which evaluates trail_price/trail_offset once per bar.
-        
-        We do NOT market-close on normal SL/TP hit — the exchange trigger order
-        handles that. This avoids race conditions where both fire simultaneously
-        and create a reverse position.
+
+        Checks SL and TP intra-bar (Pine broker emulator does this too).
+        Trailing stop is checked on candle close only (in _manage_position_on_candle)
+        to match Pine's bar-close evaluation behavior.
         """
+        if not self._warmup_done or not self.state.in_position:
+            return None
         s = self.state
-        if not self._warmup_done or not s.in_position or self._lock:
+        if not (s.pending_sl > 0 or s.pending_tp > 0):
             return None
 
-        # ── Emergency backup: price past exchange SL for >30 seconds ──
-        # Exchange SL trigger should fire almost instantly. If price stays
-        # past SL for 30s, something is wrong — force market close.
-        # IMPORTANT: compare against _last_exchange_sl (what's actually on exchange),
-        # not s.current_sl (internal trailing which may be ahead of exchange due to throttle).
-        #
-        # Grace period: skip emergency check for 5s after an exchange SL update,
-        # because the trigger order needs time to be processed by HL.
-        exchange_sl = self._last_exchange_sl if self._last_exchange_sl > 0 else s.current_sl
-        sl_just_updated = (time.time() - self._last_sl_exchange_update) < 5
+        is_long = s.position_side == "long"
 
-        if s.position_side == "long":
-            sl_breached = price <= exchange_sl
-            breach_amount = exchange_sl - price if sl_breached else 0
-        else:
-            sl_breached = price >= exchange_sl
-            breach_amount = price - exchange_sl if sl_breached else 0
-
-        if sl_breached and not sl_just_updated:
-            now = time.time()
-            if self._emergency_first_seen == 0:
-                self._emergency_first_seen = now
-                logger.warning(
-                    f"⚠️ [{self.symbol}] Price {price:.2f} past exchange SL {exchange_sl:.2f} "
-                    f"by {breach_amount:.2f} (internal SL={s.current_sl:.2f}) — exchange should close within {self._emergency_timeout}s"
-                )
-                return None
-
-            elapsed = now - self._emergency_first_seen
-            if elapsed >= self._emergency_timeout:
-                logger.error(
-                    f"🆘 [{self.symbol}] EMERGENCY CLOSE: price={price:.2f} past exchange SL={exchange_sl:.2f} "
-                    f"(internal={s.current_sl:.2f}) for {elapsed:.0f}s — exchange trigger failed!"
-                )
-                self._emergency_first_seen = 0
-                return self._close_and_handle(price)
-            return None
-        else:
-            # Reset emergency timer if price came back within SL
-            if self._emergency_first_seen > 0:
-                elapsed = time.time() - self._emergency_first_seen
+        # ── Check TP ──
+        if s.pending_tp > 0:
+            if (is_long and price >= s.pending_tp) or (not is_long and price <= s.pending_tp):
                 logger.info(
-                    f"[{self.symbol}] Price {price:.2f} back within exchange SL {exchange_sl:.2f} "
-                    f"— emergency timer reset ({elapsed:.1f}s)"
+                    f"🎯 [{self.symbol}] TP HIT (intra-bar): price={price:.2f} "
+                    f"TP={s.pending_tp:.2f}"
                 )
-            self._emergency_first_seen = 0
+                s.exit_reason = "tp"
+                self._exit_was_intra_bar = True
+                return self._close_and_handle(s.pending_tp)
 
-        # Breakeven and trailing are evaluated on candle close only
-        # (in _manage_position_on_candle), matching Pine Script behavior.
-        # on_price_update only handles emergency SL backup.
+        # ── Check SL ──
+        if s.pending_sl > 0:
+            if (is_long and price <= s.pending_sl) or (not is_long and price >= s.pending_sl):
+                logger.info(
+                    f"🛑 [{self.symbol}] SL HIT (intra-bar): price={price:.2f} "
+                    f"SL={s.pending_sl:.2f}"
+                )
+                s.exit_reason = "sl"
+                self._exit_was_intra_bar = True
+                return self._close_and_handle(s.pending_sl)
+
+        # Trailing stop: activation tracking only (no exit on ticks).
+        # Peak is updated tick-by-tick so we capture the true high/low,
+        # but the actual trail exit decision happens on candle close.
+        if s.pending_trail_activation > 0 and s.pending_trail_offset > 0:
+            if is_long:
+                if price >= s.pending_trail_activation and not s.trailing_active:
+                    s.trailing_active = True
+                    s.trailing_peak = price
+                    logger.info(
+                        f"📈 [{self.symbol}] Trail ACTIVATED (intra-bar): "
+                        f"price={price:.2f} >= activation={s.pending_trail_activation:.2f}"
+                    )
+                elif s.trailing_active and price > s.trailing_peak:
+                    s.trailing_peak = price
+            else:  # short
+                if price <= s.pending_trail_activation and not s.trailing_active:
+                    s.trailing_active = True
+                    s.trailing_peak = price
+                    logger.info(
+                        f"📉 [{self.symbol}] Trail ACTIVATED (intra-bar): "
+                        f"price={price:.2f} <= activation={s.pending_trail_activation:.2f}"
+                    )
+                elif s.trailing_active and price < s.trailing_peak:
+                    s.trailing_peak = price
+
         return None
-
-    async def _update_exchange_sl(self):
-        """Update exchange SL/TP trigger orders to match current trailing SL."""
-        s = self.state
-        if not s.in_position or self._lock:
-            return
-        # Deduplicate: skip if exchange already has this SL value
-        if s.current_sl == self._last_exchange_sl:
-            return
-        try:
-            logger.info(
-                f"🔄 [{self.symbol}] WS trailing → exchange SL update: {s.current_sl:.2f}"
-            )
-            await self.trader.replace_sl_tp(
-                symbol=self.symbol,
-                size=s.entry_size,
-                side=s.position_side,
-                sl_price=s.current_sl,
-                tp_price=s.take_profit,
-            )
-            # Re-check: if position was closed during the await (race condition),
-            # we just placed orphan orders — clean them up immediately
-            if not s.in_position:
-                logger.warning(f"[{self.symbol}] Position closed during SL update — cleaning orphan orders")
-                await self.trader.cancel_all_orders(self.symbol)
-                return
-            self._last_exchange_sl = s.current_sl
-        except Exception as e:
-            logger.error(f"[{self.symbol}] Failed to update exchange SL: {e}")
 
     def on_user_fill(self, fill: dict):
         """
@@ -1096,6 +1134,7 @@ class StrategyEngine:
             # Position was closed by exchange trigger — clean up remaining orders + state
             if self.state.in_position and not self._lock:
                 self._lock = True
+                self._exit_was_intra_bar = True  # SL/TP fired between candle closes
                 try:
                     await self.trader.cancel_all_orders(self.symbol)
                     # Safety: wait briefly then verify no ghost position
@@ -1183,20 +1222,20 @@ class StrategyEngine:
 
     async def _manage_position_on_candle(self, candles: List[dict]):
         """
-        Called on new candle close. Computes trailing SL and updates exchange.
+        Called on new candle close.
         
-        Trailing SL is evaluated HERE (candle close only), matching Pine Script's
-        strategy.exit() which processes trail_price/trail_offset once per bar.
-        This prevents tick-by-tick trailing from setting overly tight stops.
+        Pine flow: entries on close only, SL/TP intra-bar via on_price_update().
+        Trailing stop checked here on candle close to match Pine bar-close semantics.
+        Then recalculates exit levels (SL/TP/trail) for the next bar.
         """
         s = self.state
         if not s.in_position:
             return
 
-        # Verify position still exists
+        # Verify position still exists (may have been closed by exchange or RT monitor)
         pos = self.trader.get_position(self.symbol)
         if pos is None:
-            logger.info(f"[{self.symbol}] Position closed (detected on candle).")
+            logger.info(f"[{self.symbol}] Position closed externally.")
             try:
                 await self.trader.cancel_all_orders(self.symbol)
             except Exception as e:
@@ -1204,75 +1243,168 @@ class StrategyEngine:
             await self._on_position_closed(candles, exit_price=candles[-1]["c"])
             return
 
-        # ── Breakeven + Trailing SL (candle close only — mirrors Pine) ──
-        # Pine evaluates strategy.exit() once per bar close. Both breakeven
-        # (reached1R check) and trailing use the candle CLOSE price.
-        closed = candles[-1]  # last closed candle from tick()'s candles[:-1]
+        closed = candles[-1]
         close_price = closed["c"]
-        old_sl = s.current_sl
+        high = closed["h"]
+        low = closed["l"]
+        entry_price = s.entry_price
 
-        # Breakeven: Pine checks `close >= entry + slDistance` on bar close
-        if s.position_side == "long":
-            if not s.breakeven_applied and close_price >= s.entry_price + s.sl_distance:
-                buffer = s.sl_distance * 0.02
-                new_sl = max(s.initial_sl, s.zone_level - buffer)
-                if new_sl > s.current_sl:
-                    s.current_sl = new_sl
-                    s.breakeven_applied = True
-                    logger.info(f"🔒 [{self.symbol}] Breakeven (candle close): SL → {s.current_sl:.2f}")
-        else:  # short
-            if not s.breakeven_applied and close_price <= s.entry_price - s.sl_distance:
-                buffer = s.sl_distance * 0.02
-                new_sl = min(s.initial_sl, s.zone_level + buffer)
-                if new_sl < s.current_sl:
-                    s.current_sl = new_sl
-                    s.breakeven_applied = True
-                    logger.info(f"🔒 [{self.symbol}] Breakeven (candle close): SL → {s.current_sl:.2f}")
+        logger.info(
+            f"📋 [{self.symbol}] Position check: {s.position_side.upper()} @ {entry_price:.2f} | "
+            f"bar O={closed['o']:.2f} H={high:.2f} L={low:.2f} C={close_price:.2f} | "
+            f"SL={s.pending_sl:.2f} TP={s.pending_tp:.2f} trail={'ON' if s.trailing_active else 'off'}"
+        )
 
-        # Trailing SL
-        if s.position_side == "long":
-            trail_activation = s.sl_distance * STRATEGY.RR_RATIO * STRATEGY.TRAIL_ACTIVATION_RATIO
-            trail_offset = s.sl_distance * STRATEGY.TRAIL_OFFSET_RATIO
-            if close_price >= s.entry_price + trail_activation:
-                trailing_sl = close_price - trail_offset
-                if trailing_sl > s.current_sl:
-                    s.current_sl = trailing_sl
+        # ── Trailing stop check on candle close ──
+        # Pine broker emulator checks trail against bar OHLC, not ticks.
+        # We check against the closed bar's high/low for activation and
+        # close price for trail exit — matching Pine's bar-close semantics.
+        if s.pending_trail_activation > 0 and s.pending_trail_offset > 0:
+            is_long = s.position_side == "long"
+
+            # Activation: use bar's high (long) or low (short)
+            if is_long:
+                if high >= s.pending_trail_activation and not s.trailing_active:
                     s.trailing_active = True
+                    s.trailing_peak = high
                     logger.info(
-                        f"📈 [{self.symbol}] Trailing SL → {s.current_sl:.2f} "
-                        f"(close={close_price:.2f}, offset={trail_offset:.2f})"
+                        f"📈 [{self.symbol}] Trail ACTIVATED (bar close): "
+                        f"high={high:.2f} >= activation={s.pending_trail_activation:.2f}"
                     )
-        else:  # short
-            trail_activation = s.sl_distance * STRATEGY.RR_RATIO * STRATEGY.TRAIL_ACTIVATION_RATIO
-            trail_offset = s.sl_distance * STRATEGY.TRAIL_OFFSET_RATIO
-            if close_price <= s.entry_price - trail_activation:
-                trailing_sl = close_price + trail_offset
-                if trailing_sl < s.current_sl:
-                    s.current_sl = trailing_sl
+                elif s.trailing_active and high > s.trailing_peak:
+                    s.trailing_peak = high
+            else:
+                if low <= s.pending_trail_activation and not s.trailing_active:
                     s.trailing_active = True
+                    s.trailing_peak = low
                     logger.info(
-                        f"📉 [{self.symbol}] Trailing SL → {s.current_sl:.2f} "
-                        f"(close={close_price:.2f}, offset={trail_offset:.2f})"
+                        f"📉 [{self.symbol}] Trail ACTIVATED (bar close): "
+                        f"low={low:.2f} <= activation={s.pending_trail_activation:.2f}"
                     )
+                elif s.trailing_active and low < s.trailing_peak:
+                    s.trailing_peak = low
 
-        if s.current_sl != old_sl:
-            self._save_state()
+            # Trail exit: check if close crossed the trailing SL
+            if s.trailing_active:
+                if is_long:
+                    trail_sl = s.trailing_peak - s.pending_trail_offset
+                    if close_price <= trail_sl:
+                        logger.info(
+                            f"📈 [{self.symbol}] TRAIL EXIT (bar close): "
+                            f"close={close_price:.2f} <= trail_sl={trail_sl:.2f} "
+                            f"(peak={s.trailing_peak:.2f})"
+                        )
+                        s.exit_reason = "trailing"
+                        self._exit_was_intra_bar = False
+                        await self._close_and_handle(close_price)
+                        return
+                else:
+                    trail_sl = s.trailing_peak + s.pending_trail_offset
+                    if close_price >= trail_sl:
+                        logger.info(
+                            f"📉 [{self.symbol}] TRAIL EXIT (bar close): "
+                            f"close={close_price:.2f} >= trail_sl={trail_sl:.2f} "
+                            f"(peak={s.trailing_peak:.2f})"
+                        )
+                        s.exit_reason = "trailing"
+                        self._exit_was_intra_bar = False
+                        await self._close_and_handle(close_price)
+                        return
 
-        # Update exchange SL if it changed AND wasn't already synced
-        if s.current_sl != self._last_exchange_sl and s.current_sl != s.initial_sl:
-            arrow = '📈' if s.position_side == 'long' else '📉'
+        # Recalculate exit levels for next bar
+        await self._recalculate_exit_levels(candles)
+
+    async def _recalculate_exit_levels(self, candles: List[dict]):
+        """
+        PART B: Recalculate exit levels for the next bar.
+        Pine: slDistance, SL, TP, trail recalculated every bar via strategy.exit().
+        These become active for the next bar's broker emulator check.
+        """
+        s = self.state
+        if not s.in_position:
+            return
+
+        close_price = candles[-1]["c"]
+        entry_price = s.entry_price
+
+        atr = compute_atr(candles, STRATEGY.ATR_LENGTH)
+        if atr <= 0:
+            atr = s.sl_distance / STRATEGY.SL_MULTIPLIER if s.sl_distance > 0 else 1.0
+        sl_distance = STRATEGY.SL_MULTIPLIER * atr
+
+        if s.position_side == "long":
+            initial_sl = entry_price - sl_distance
+            take_profit = entry_price + sl_distance * STRATEGY.RR_RATIO
+        else:
+            initial_sl = entry_price + sl_distance
+            take_profit = entry_price - sl_distance * STRATEGY.RR_RATIO
+
+        # ── Breakeven (conditional, reversible — exactly like Pine) ──
+        BUFFER_PRICE = 0.20  # syminfo.mintick * 20 = $0.01 * 20
+
+        if s.position_side == "long":
+            be_level = s.bull_ob if s.entry_source == "OB" else s.bull_fvg_bottom
+            reached_1r = close_price >= entry_price + sl_distance
+            current_sl = max(initial_sl, be_level - BUFFER_PRICE) if reached_1r else initial_sl
+        else:
+            be_level = s.bear_ob if s.entry_source == "OB" else s.bear_fvg_top
+            reached_1r = close_price <= entry_price - sl_distance
+            current_sl = min(initial_sl, be_level + BUFFER_PRICE) if reached_1r else initial_sl
+
+        # Log breakeven changes
+        if reached_1r and not s.breakeven_applied:
+            s.breakeven_applied = True
             logger.info(
-                f"{arrow} [{self.symbol}] Candle sync exchange SL → {s.current_sl:.2f}"
+                f"🔒 [{self.symbol}] Breakeven reached: SL={current_sl:.2f} "
+                f"(beLevel={be_level:.2f}, initialSL={initial_sl:.2f})"
             )
-            self._last_exchange_sl = s.current_sl  # Optimistic: prevent race
-            await self.trader.replace_sl_tp(
-                symbol=self.symbol,
-                size=s.entry_size,
-                side=s.position_side,
-                sl_price=s.current_sl,
-                tp_price=s.take_profit,
+        elif not reached_1r and s.breakeven_applied:
+            s.breakeven_applied = False
+            logger.info(f"🔓 [{self.symbol}] Breakeven reverted: SL back to initialSL={initial_sl:.2f}")
+
+        # ── Trail parameters ──
+        trail_activation_price = entry_price + sl_distance * STRATEGY.RR_RATIO * STRATEGY.TRAIL_ACTIVATION_RATIO \
+            if s.position_side == "long" else \
+            entry_price - sl_distance * STRATEGY.RR_RATIO * STRATEGY.TRAIL_ACTIVATION_RATIO
+        trail_offset_price = sl_distance * STRATEGY.TRAIL_OFFSET_RATIO  # 20% of SL distance in $
+
+        # ── Store pending levels for next bar's real-time monitoring ──
+        s.pending_sl = current_sl
+        s.pending_tp = take_profit
+        s.pending_trail_activation = trail_activation_price
+        s.pending_trail_offset = trail_offset_price
+        s.current_sl = current_sl
+        s.sl_distance = sl_distance
+        s.initial_sl = initial_sl
+        s.take_profit = take_profit
+
+        # Log updated levels
+        if s.trailing_active:
+            trail_sl = (s.trailing_peak - trail_offset_price) if s.position_side == "long" \
+                else (s.trailing_peak + trail_offset_price)
+            logger.info(
+                f"📊 [{self.symbol}] Levels updated: SL={current_sl:.2f} TP={take_profit:.2f} | "
+                f"Trail ON: peak={s.trailing_peak:.2f} trail_sl={trail_sl:.2f} offset=${trail_offset_price:.4f}"
             )
-            self._last_sl_exchange_update = time.time()
+        else:
+            logger.info(
+                f"📊 [{self.symbol}] Levels updated: SL={current_sl:.2f} TP={take_profit:.2f} | "
+                f"Trail activation={trail_activation_price:.2f} offset=${trail_offset_price:.4f}"
+            )
+
+        self._save_state()
+
+    # ── emergency SL helper ─────────────────────────────────
+    def _calc_emergency_sl(self, side: str, base_sl: float, sl_distance: float) -> float:
+        """Calculate wide emergency SL for exchange (safety net only).
+        Set at 2x the SL distance from the base_sl price, giving room for
+        candle-close evaluation to handle normal SL hits.
+        """
+        EMERGENCY_MULT = 1.0  # extra distance beyond base_sl
+        if side == "long":
+            return base_sl - sl_distance * EMERGENCY_MULT
+        else:
+            return base_sl + sl_distance * EMERGENCY_MULT
 
     # ── trade log ────────────────────────────────────────────
     def _save_trade(self, trade: dict):
