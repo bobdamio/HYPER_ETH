@@ -655,6 +655,7 @@ class StrategyEngine:
         s.last_exit_bar = s.bar_counter
         s.last_exit_t = s.last_bar_t
         self._last_exchange_sl = 0.0  # Reset for next position
+        self._exit_pending = False  # Allow new exit checks for next position
 
         self._save_state()
 
@@ -937,6 +938,8 @@ class StrategyEngine:
         """
         if not self._warmup_done or not self.state.in_position:
             return None
+        if getattr(self, '_exit_pending', False):
+            return None  # Already closing, skip further checks
         s = self.state
         if not (s.pending_sl > 0 or s.pending_tp > 0):
             return None
@@ -952,6 +955,7 @@ class StrategyEngine:
                 )
                 s.exit_reason = "tp"
                 self._exit_was_intra_bar = True
+                self._exit_pending = True
                 return self._close_and_handle(s.pending_tp)
 
         # ── Check SL ──
@@ -963,6 +967,7 @@ class StrategyEngine:
                 )
                 s.exit_reason = "sl"
                 self._exit_was_intra_bar = True
+                self._exit_pending = True
                 return self._close_and_handle(s.pending_sl)
 
         # Trailing stop: activation, peak tracking, AND exit — all intra-bar.
@@ -1002,6 +1007,7 @@ class StrategyEngine:
                         )
                         s.exit_reason = "trailing"
                         self._exit_was_intra_bar = True
+                        self._exit_pending = True
                         return self._close_and_handle(price)
                 else:
                     trail_sl = s.trailing_peak + s.pending_trail_offset
@@ -1013,6 +1019,7 @@ class StrategyEngine:
                         )
                         s.exit_reason = "trailing"
                         self._exit_was_intra_bar = True
+                        self._exit_pending = True
                         return self._close_and_handle(price)
 
         return None
