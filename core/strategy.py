@@ -818,9 +818,11 @@ class StrategyEngine:
         risk_dollars = (equity * s.current_risk) / 100
         size_coin = risk_dollars / sl_distance
 
-        # Clamp size: Pine — maxSize = (strategy.equity * 0.95) / close
+        # Clamp size: maxSize = (equity * 0.95 * leverage) / close
+        # Pine doesn't model leverage (margin=100%), but on HyperLiquid
+        # with 10x leverage, equity buys 10x more notional.
         min_size = 0.001
-        max_size = (equity * RISK.MAX_EQUITY_USAGE) / entry_price
+        max_size = (equity * RISK.MAX_EQUITY_USAGE * STRATEGY.LEVERAGE) / entry_price
         size_coin = max(min_size, min(size_coin, max_size))
 
         # Check minimum notional ($11)
